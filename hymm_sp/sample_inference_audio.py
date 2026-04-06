@@ -5,10 +5,6 @@ import random
 from loguru import logger
 from einops import rearrange
 from hymm_sp.diffusion import load_diffusion_pipeline
-import hashlib
-
-CACHE_DIR = "/workspace/HunyuanVideo-Avatar/cache/embeddings"
-os.makedirs(CACHE_DIR, exist_ok=True)
 from hymm_sp.helpers import get_nd_rotary_pos_embed_new
 from hymm_sp.inference import Inference
 from hymm_sp.diffusion.schedulers import FlowMatchDiscreteScheduler
@@ -151,18 +147,6 @@ class HunyuanVideoSampler(Inference):
                                                 (ref_latents.shape[-2], 
                                                 ref_latents.shape[-1]), 
                                                 mode="bilinear").unsqueeze(2).to(dtype=ref_latents.dtype)
-
-        # Save to cache if this was a miss
-        if not os.path.exists(cache_path):
-            uncond_pixel_value_llava = torch.zeros_like(pixel_value_llava)
-            torch.save({
-                'ref_latents': ref_latents.cpu(),
-                'uncond_ref_latents': uncond_ref_latents.cpu(),
-                'face_masks': face_masks.cpu(),
-                'pixel_value_llava': pixel_value_llava.cpu(),
-                'uncond_pixel_value_llava': uncond_pixel_value_llava.cpu(),
-            }, cache_path)
-            print(f"[Cache] Saved embeddings to {cache_path}")
 
 
         size = (batch['pixel_value_ref'].shape[-2], batch['pixel_value_ref'].shape[-1])
