@@ -46,13 +46,21 @@ def main():
     tc_model = hunyuan_video_sampler.model
     tc_model.enable_teacache = True
     tc_model.teacache_num_steps = args.infer_steps
-    tc_model.teacache_thresh = 0.15
+    tc_model.teacache_thresh = 0.18
     tc_model.teacache_cnt = 0
     tc_model.teacache_accumulated_distance = 0
     tc_model.teacache_previous_modulated_input = None
     tc_model.teacache_previous_residual = None
     tc_model.teacache_skipped_steps = 0
     print(f"TeaCache ENABLED: thresh={tc_model.teacache_thresh}, steps={tc_model.teacache_num_steps}")
+    # VAE tile override - bigger tiles = fewer passes (4 instead of 27 on H100)
+    _vae = hunyuan_video_sampler.vae if hasattr(hunyuan_video_sampler, "vae") else hunyuan_video_sampler.pipeline.vae
+    _vae.tile_sample_min_size = 256
+    _vae.tile_latent_min_size = 32
+    _vae.tile_sample_min_tsize = 64
+    _vae.tile_latent_min_tsize = 16
+    _vae.tile_overlap_factor = 0.25
+    print(f"VAE tile override: spatial=256, temporal=64, overlap=0.25 (was 256/64)")
     
     args = hunyuan_video_sampler.args
     if args.cpu_offload:
