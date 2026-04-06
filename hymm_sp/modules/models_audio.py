@@ -647,7 +647,23 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             else:
                 modulated_inp_val = modulated_inp
             
-            if self.teacache_previous_modulated_input is not None and self.teacache_cnt > 0 and self.teacache_cnt < self.teacache_num_steps - 1:
+            # Comprehensive TeaCache fix
+            PROTECT_EARLY_RATIO = 0.15
+            PROTECT_LATE_STEPS = 1
+            BASE_STEPS = 50
+            
+            step_ratio = self.teacache_num_steps / BASE_STEPS
+            effective_thresh = self.teacache_thresh * max(step_ratio, 0.5)
+            
+            early_cutoff = max(2, int(self.teacache_num_steps * PROTECT_EARLY_RATIO))
+            
+            if self.teacache_cnt == 0 or self.teacache_cnt == self.teacache_num_steps - 1:
+                should_calc = True
+                self.teacache_accumulated_distance = 0
+            elif self.teacache_cnt < early_cutoff:
+                should_calc = True
+                self.teacache_accumulated_distance = 0
+            elif self.teacache_previous_modulated_input is not None:
                 distance = (modulated_inp_val - self.teacache_previous_modulated_input).abs().mean()
                 prev_mean = self.teacache_previous_modulated_input.abs().mean()
                 if prev_mean > 0:
@@ -658,12 +674,14 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 coefficients = [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
                 rescale_func = np.poly1d(coefficients)
                 scaled_distance = rescale_func(rel_distance.item())
+                scaled_distance = max(scaled_distance, 0.0)
                 self.teacache_accumulated_distance += scaled_distance
                 
-                if self.teacache_accumulated_distance < self.teacache_thresh:
+                if self.teacache_accumulated_distance < effective_thresh:
                     should_calc = False
                     self.teacache_skipped_steps += 1
                 else:
+                    should_calc = True
                     self.teacache_accumulated_distance = 0
             
             self.teacache_previous_modulated_input = modulated_inp_val.clone()
