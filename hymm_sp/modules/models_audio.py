@@ -7,7 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+try:
+    from flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 from .activation_layers import get_activation_layer
 from .norm_layers import get_norm_layer
