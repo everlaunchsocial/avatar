@@ -10,6 +10,11 @@ from hymm_sp.inference import Inference
 from hymm_sp.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hymm_sp.data_kits.audio_preprocessor import encode_audio, get_facemask
 
+import hashlib
+import os as _cache_os
+CACHE_DIR = "/workspace/HunyuanVideo-Avatar/cache/embeddings"
+_cache_os.makedirs(CACHE_DIR, exist_ok=True)
+
 def align_to(value, alignment):
     return int(math.ceil(value / alignment) * alignment)
 
@@ -129,8 +134,18 @@ class HunyuanVideoSampler(Inference):
                 self.vae.to('cuda')
 
             self.vae.enable_tiling()
-            ref_latents = self.vae.encode(pixel_value_ref_for_vae.clone()).latent_dist.sample()
-            uncond_ref_latents = self.vae.encode(uncond_uncond_pixel_value_ref).latent_dist.sample()
+            _img_hash = hashlib.md5(open(image_path, 'rb').read()).hexdigest()
+            _cache_path = _cache_os.path.join(CACHE_DIR, f"vae_{_img_hash}.pt")
+            if _cache_os.path.exists(_cache_path):
+                print(f"[Cache] HIT - VAE latents for {_img_hash[:8]}")
+                _cached = torch.load(_cache_path, map_location=self.device)
+                ref_latents = _cached['ref'].to(device=self.device, dtype=vae_dtype)
+                uncond_ref_latents = _cached['uncond'].to(device=self.device, dtype=vae_dtype)
+            else:
+                print(f"[Cache] MISS - Encoding VAE latents for {_img_hash[:8]}")
+                ref_latents = self.vae.encode(pixel_value_ref_for_vae.clone()).latent_dist.sample()
+                uncond_ref_latents = self.vae.encode(uncond_uncond_pixel_value_ref).latent_dist.sample()
+                torch.save({'ref': ref_latents.cpu(), 'uncond': uncond_ref_latents.cpu()}, _cache_path)
             self.vae.disable_tiling()
             if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
                 ref_latents.sub_(self.vae.config.shift_factor).mul_(self.vae.config.scaling_factor)
