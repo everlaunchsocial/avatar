@@ -196,7 +196,9 @@ class UpsampleCausal3D(nn.Module):
                 first_h, other_h = hidden_states.split((1, T-1), dim=2)
                 if output_size is None:
                     if T > 1:
-                        other_h = F.interpolate(other_h, scale_factor=self.upsample_factor, mode="nearest")
+                        # VAE INT_MAX bypass: chunk upsample along temporal dim for long videos
+                        _chunks = other_h.split(16, dim=2)
+                        other_h = torch.cat([F.interpolate(_c, scale_factor=self.upsample_factor, mode="nearest") for _c in _chunks], dim=2)
     
                     first_h = first_h.squeeze(2)
                     first_h = F.interpolate(first_h, scale_factor=self.upsample_factor[1:], mode="nearest")
@@ -210,7 +212,9 @@ class UpsampleCausal3D(nn.Module):
                 else:
                     hidden_states = first_h
             else:
-                hidden_states = F.interpolate(hidden_states, scale_factor=self.upsample_factor, mode="nearest")                
+                # VAE INT_MAX bypass: chunk upsample along temporal dim for long videos
+                _chunks = hidden_states.split(16, dim=2)
+                hidden_states = torch.cat([F.interpolate(_c, scale_factor=self.upsample_factor, mode="nearest") for _c in _chunks], dim=2)                
 
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)

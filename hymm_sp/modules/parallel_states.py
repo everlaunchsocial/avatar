@@ -350,7 +350,7 @@ def parallel_attention(q, k, v, img_q_len, img_kv_len, cu_seqlens_q, cu_seqlens_
         cu_seqlens_kv,
         max_seqlen_q,
         max_seqlen_kv,
-    )
+    )[0]
     # B, S, 3, H, D
     hidden_states = hidden_states.view(bsz, max_seqlen_q, head, head_dim).contiguous()
     

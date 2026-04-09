@@ -181,7 +181,7 @@ class DoubleStreamBlock(nn.Module):
                 cu_seqlens_kv,
                 max_seqlen_q,
                 max_seqlen_kv,
-            )
+            )[0]
             attn = attn.view(img_k.shape[0], max_seqlen_q, -1).contiguous()
         else:
                 attn, _ = parallel_attention(
@@ -323,7 +323,7 @@ class SingleStreamBlock(nn.Module):
                 cu_seqlens_kv,
                 max_seqlen_q,
                 max_seqlen_kv,
-            )
+            )[0]
             attn = attn.view(x.shape[0], max_seqlen_q, -1).contiguous()
         else:
             img_v, txt_v = v[:, :-txt_len, :, :], v[:, -txt_len:, :, :]
