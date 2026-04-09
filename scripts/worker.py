@@ -106,7 +106,6 @@ def fail_job(sb, jid, msg):
         sb.table("video_jobs").update({
             "status": "failed",
             "error_message": msg,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", jid).execute()
     except Exception as e:
         log(f"fail update err: {e}")
@@ -157,7 +156,6 @@ def process_job(sb, job):
             "status": "done",
             "output_url": pu,
             "render_time_ms": ms,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", jid).execute()
         log(f"=== job {jid} DONE {ms}ms ===")
     except subprocess.TimeoutExpired:
