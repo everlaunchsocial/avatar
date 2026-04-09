@@ -25,7 +25,7 @@ RUN cd /workspace && \
     CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:$PATH \
     TORCH_CUDA_ARCH_LIST="9.0a" \
-    MAX_JOBS=4 \
+    MAX_JOBS=1 \
     FLASH_ATTENTION_FORCE_BUILD=TRUE \
     python3 setup.py install && \
     cd /workspace && rm -rf flash-attention
