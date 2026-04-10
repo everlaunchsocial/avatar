@@ -88,6 +88,7 @@ class HunyuanVideoSampler(Inference):
         """
         
         out_dict = dict()
+    wav2vec = wav2vec.to("cuda")
 
         prompt = batch['text_prompt'][0]
         image_path = str(batch["image_path"][0])
@@ -105,7 +106,7 @@ class HunyuanVideoSampler(Inference):
         else:
             audio_prompts = torch.cat([audio_prompts, torch.zeros_like(audio_prompts[:, :1]).repeat(1, 5, 1, 1, 1)], dim=1)
         
-        wav2vec.to("cpu")
+        # wav2vec.to("cpu")
         torch.cuda.empty_cache()
 
         uncond_audio_prompts = torch.zeros_like(audio_prompts[:,:129])
