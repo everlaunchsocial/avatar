@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
-# EverLaunch Avatar Studio worker. Polls video_jobs, runs renders, uploads results.
-import os, sys, time, json, subprocess, traceback
+"""EverLaunch Avatar Studio worker. Model loaded ONCE, stays in VRAM between jobs."""
+import os, sys, time, json, traceback
+import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
+
+import torch
+import torch.distributed as dist
+from einops import rearrange
+import imageio
+
+# Initialize distributed (required by the model)
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "29500"
+if not dist.is_initialized():
+    dist.init_process_group(backend="nccl", world_size=1, rank=0)
+
 import requests
 from supabase import create_client, Client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
-RENDER_TIMEOUT = int(os.environ.get("RENDER_TIMEOUT", "1800"))
 WORKSPACE = Path("/workspace/HunyuanVideo-Avatar")
-ASSETS_TMP = WORKSPACE / "assets" / "worker_tmp"
-RESULTS_DIR = WORKSPACE / "results" / "worker"
-CKPT_REL = "./weights/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt"
-CKPT_PATH = WORKSPACE / "weights/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt"
+MODEL_BASE = os.environ.get("MODEL_BASE", str(WORKSPACE / "weights"))
 BUCKET = "rendered-videos"
 FMAP = {"5s": 129, "10s": 257, "15s": 385, "30s": 769}
+
+# Add workspace to path
+sys.path.insert(0, str(WORKSPACE))
+os.environ["PYTHONPATH"] = str(WORKSPACE)
+os.environ["MODEL_BASE"] = MODEL_BASE
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def log(m):
@@ -24,16 +39,177 @@ def log(m):
     print(f"[{ts}] [worker] {m}", flush=True)
 
 
+# ============================================================
+# MODEL LOADING — happens ONCE at startup, stays in VRAM
+# ============================================================
+def load_engine():
+    """Load the full HunyuanVideo-Avatar engine into GPU memory. Called once."""
+    from hymm_sp.config import parse_args
+    from hymm_sp.sample_inference_audio import HunyuanVideoSampler
+    from hymm_sp.data_kits.face_align import AlignImage
+    from transformers import WhisperModel, AutoFeatureExtractor
+
+    log("loading engine...")
+    device = torch.device("cuda")
+
+    # Parse default args with our settings
+    sys.argv = [
+        "worker",
+        "--input", "dummy.csv",
+        "--ckpt", f"{MODEL_BASE}/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt",
+        "--sample-n-frames", "129",
+        "--seed", "128",
+        "--image-size", "704",
+        "--cfg-scale", "7.5",
+        "--infer-steps", "50",
+        "--use-deepcache", "1",
+        "--flow-shift-eval-video", "5.0",
+        "--save-path", str(WORKSPACE / "results"),
+        "--use-fp8",
+    ]
+    args = parse_args()
+
+    # Load the main sampler (transformer + VAE + text encoders)
+    log("loading HunyuanVideoSampler (this takes ~60s)...")
+    sampler = HunyuanVideoSampler.from_pretrained(args.ckpt, args=args, device=device)
+
+    # TeaCache setup
+    tc = sampler.model
+    tc.enable_teacache = True
+    tc.teacache_num_steps = 50
+    tc.teacache_thresh = 0.18
+    tc.teacache_cnt = 0
+    tc.teacache_accumulated_distance = 0
+    tc.teacache_previous_modulated_input = None
+    tc.teacache_previous_residual = None
+    tc.teacache_skipped_steps = 0
+    log("TeaCache enabled: thresh=0.18")
+
+    # VAE tile override for H100 80GB
+    vae = sampler.vae if hasattr(sampler, "vae") else sampler.pipeline.vae
+    vae.tile_sample_min_size = 256
+    vae.tile_latent_min_size = 32
+    vae.tile_sample_min_tsize = 64
+    vae.tile_latent_min_tsize = 16
+    vae.tile_overlap_factor = 0.25
+    log("VAE tile override: spatial=256, temporal=64, overlap=0.25")
+
+    # Load audio model (whisper)
+    log("loading wav2vec...")
+    wav2vec = WhisperModel.from_pretrained(f"{MODEL_BASE}/ckpts/whisper-tiny/").to(device=device, dtype=torch.float32)
+    wav2vec.requires_grad_(False)
+
+    # Load face alignment
+    log("loading face alignment...")
+    det_path = os.path.join(MODEL_BASE, "ckpts/det_align/detface.pt")
+    align_instance = AlignImage("cuda", det_path=det_path)
+
+    # Load feature extractor
+    feature_extractor = AutoFeatureExtractor.from_pretrained(f"{MODEL_BASE}/ckpts/whisper-tiny/")
+
+    args = sampler.args
+    log("engine loaded. model is in VRAM and ready.")
+
+    return {
+        "sampler": sampler,
+        "args": args,
+        "wav2vec": wav2vec,
+        "align_instance": align_instance,
+        "feature_extractor": feature_extractor,
+        "device": device,
+    }
+
+
+# ============================================================
+# RENDER — called per job, model already loaded
+# ============================================================
+def render(engine, image_path, audio_path, output_path, settings):
+    """Run a render using the pre-loaded engine. No model loading — fast."""
+    from hymm_sp.data_kits.audio_dataset import VideoAudioTextLoaderVal
+    from torch.utils.data import DataLoader
+
+    sampler = engine["sampler"]
+    args = engine["args"]
+    wav2vec = engine["wav2vec"]
+    align_instance = engine["align_instance"]
+    feature_extractor = engine["feature_extractor"]
+
+    # Override args with job settings
+    args.infer_steps = int(settings.get("inference_steps", 50))
+    args.cfg_scale = float(settings.get("cfg_scale", 7.5))
+    args.flow_shift_eval_video = float(settings.get("flow_shift", 5.0))
+    length = settings.get("video_length", "5s")
+    args.sample_n_frames = FMAP.get(length, 129)
+    seed_val = settings.get("seed")
+    args.seed = int(seed_val) if seed_val not in (None, "", 0) else 128
+
+    # Update TeaCache for current step count
+    tc = sampler.model
+    tc.teacache_num_steps = args.infer_steps
+    tc.teacache_cnt = 0
+    tc.teacache_accumulated_distance = 0
+    tc.teacache_previous_modulated_input = None
+    tc.teacache_previous_residual = None
+    tc.teacache_skipped_steps = 0
+
+    teacache_enabled = settings.get("teacache_enabled", True)
+    tc.enable_teacache = bool(teacache_enabled)
+    if teacache_enabled:
+        tc.teacache_thresh = float(settings.get("teacache_threshold", 0.18))
+
+    # Create temporary CSV for the dataset loader
+    prompt = (settings.get("prompt") or "A person speaking naturally and confidently").replace(",", " ").strip()
+    csv_path = image_path.parent / "input.csv"
+    csv_path.write_text(f"videoid,image,audio,prompt,fps\n1,{image_path},{audio_path},{prompt},25\n")
+
+    # Load the data
+    kwargs = {
+        "text_encoder": sampler.text_encoder,
+        "text_encoder_2": sampler.text_encoder_2,
+        "feature_extractor": feature_extractor,
+    }
+    dataset = VideoAudioTextLoaderVal(image_size=args.image_size, meta_file=str(csv_path), **kwargs)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    for batch in loader:
+        fps = batch["fps"]
+        audio_path_str = str(batch["audio_path"][0])
+
+        # Run prediction — THIS IS THE FAST PART (model already in VRAM)
+        start = time.time()
+        samples = sampler.predict(args, batch, wav2vec, feature_extractor, align_instance)
+        render_time = time.time() - start
+        log(f"predict() took {render_time:.1f}s")
+
+        if samples is None:
+            raise RuntimeError("predict() returned None")
+
+        sample = samples["samples"][0].unsqueeze(0)
+        sample = sample[:, :, :batch["audio_len"][0]]
+
+        video = rearrange(sample[0], "c f h w -> f h w c")
+        video = (video * 255.0).data.cpu().numpy().astype(np.uint8)
+
+        torch.cuda.empty_cache()
+
+        # Save video
+        temp_video = output_path.parent / "temp_video.mp4"
+        imageio.mimsave(str(temp_video), video, fps=fps.item())
+        os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
+
+        return output_path, render_time
+
+    raise RuntimeError("no batch produced from dataset")
+
+
+# ============================================================
+# SUPABASE HELPERS
+# ============================================================
 def ensure_env():
-    miss = [n for n, v in [("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY)] if not v]
-    if miss:
-        log(f"FATAL: missing: {miss}")
+    missing = [n for n, v in [("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY)] if not v]
+    if missing:
+        log(f"FATAL: missing: {missing}")
         sys.exit(1)
-    if not CKPT_PATH.exists():
-        log(f"FATAL: no ckpt: {CKPT_PATH}")
-        sys.exit(1)
-    ASSETS_TMP.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def ensure_bucket(sb):
@@ -68,98 +244,58 @@ def dl(url, dest):
     return dest
 
 
-def build_cmd(img, aud, out, csv, s):
-    steps = int(s.get("inference_steps", 50))
-    cfg = float(s.get("cfg_scale", 7.5))
-    fs = float(s.get("flow_shift", 5.0))
-    sv = s.get("seed")
-    seed = int(sv) if sv not in (None, "", 0) else 128
-    nf = FMAP.get(s.get("video_length", "5s"), 129)
-    p = (s.get("prompt") or "A person speaking naturally and confidently").replace(",", " ").strip()
-    ri = img.relative_to(WORKSPACE)
-    ra = aud.relative_to(WORKSPACE)
-    csv.write_text(f"videoid,image,audio,prompt,fps\n1,{ri},{ra},{p},25\n")
-    cmd = [
-        "python3", "hymm_sp/sample_gpu_poor.py",
-        "--input", str(csv.relative_to(WORKSPACE)),
-        "--ckpt", CKPT_REL,
-        "--sample-n-frames", str(nf),
-        "--seed", str(seed),
-        "--image-size", "704",
-        "--cfg-scale", str(cfg),
-        "--infer-steps", str(steps),
-        "--use-deepcache", "1",
-        "--flow-shift-eval-video", str(fs),
-        "--save-path", str(out.relative_to(WORKSPACE)),
-        "--use-fp8",
-    ]
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(WORKSPACE)
-    env["MODEL_BASE"] = str(WORKSPACE / "weights")
-    env["TOKENIZERS_PARALLELISM"] = "false"
-    env["CUDA_VISIBLE_DEVICES"] = "0"
-    return cmd, env
-
-
 def fail_job(sb, jid, msg):
     try:
-        sb.table("video_jobs").update({
-            "status": "failed",
-            "error_message": msg,
-        }).eq("id", jid).execute()
+        sb.table("video_jobs").update({"status": "failed", "error_message": msg}).eq("id", jid).execute()
     except Exception as e:
         log(f"fail update err: {e}")
 
 
-def process_job(sb, job):
+def process_job(sb, engine, job):
     jid = job["id"]
     s = job.get("settings") or {}
     log(f"=== job {jid} ===")
     log(f"settings: {json.dumps(s)}")
     start = time.time()
-    jt = ASSETS_TMP / jid
-    jr = RESULTS_DIR / jid
+
+    jt = WORKSPACE / "assets" / "worker_tmp" / jid
+    jr = WORKSPACE / "results" / "worker" / jid
     jt.mkdir(parents=True, exist_ok=True)
     jr.mkdir(parents=True, exist_ok=True)
+
     try:
         iu = job.get("image_url")
         au = job.get("audio_url")
         if not iu or not au:
             raise RuntimeError("missing image_url or audio_url")
+
         ie = iu.split("?")[0].rsplit(".", 1)[-1].lower()
         ie = "jpg" if ie not in ("jpg", "jpeg", "png") else ie
         ae = au.split("?")[0].rsplit(".", 1)[-1].lower()
         ae = "wav" if ae not in ("wav", "mp3") else ae
+
         ip = dl(iu, jt / f"input.{ie}")
         ap = dl(au, jt / f"input.{ae}")
-        cp = jt / "input.csv"
-        cmd, env = build_cmd(ip, ap, jr, cp, s)
-        log(f"cmd: {' '.join(cmd)}")
-        r = subprocess.run(cmd, cwd=str(WORKSPACE), env=env, capture_output=True, text=True, timeout=RENDER_TIMEOUT)
-        if r.returncode != 0:
-            raise RuntimeError(f"render exit {r.returncode}: {(r.stderr or r.stdout or '')[-2000:]}")
-        mp4s = sorted(jr.rglob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not mp4s:
-            raise RuntimeError("no .mp4 output")
-        ov = mp4s[0]
-        log(f"output: {ov.name} ({ov.stat().st_size} bytes)")
+
+        output_file = jr / "output_audio.mp4"
+        video_path, render_time = render(engine, ip, ap, output_file, s)
+
+        log(f"output: {video_path.name} ({video_path.stat().st_size} bytes)")
+
+        # Upload to Supabase
         sp = f"{jid}.mp4"
-        fb = ov.read_bytes()
+        fb = video_path.read_bytes()
         try:
             sb.storage.from_(BUCKET).upload(path=sp, file=fb, file_options={"content-type": "video/mp4", "upsert": "true"})
         except Exception:
             ensure_bucket(sb)
             sb.storage.from_(BUCKET).upload(path=sp, file=fb, file_options={"content-type": "video/mp4", "upsert": "true"})
+
         pu = sb.storage.from_(BUCKET).get_public_url(sp)
         ms = int((time.time() - start) * 1000)
-        sb.table("video_jobs").update({
-            "status": "done",
-            "output_url": pu,
-            "render_time_ms": ms,
-        }).eq("id", jid).execute()
+        sb.table("video_jobs").update({"status": "done", "output_url": pu, "render_time_ms": ms}).eq("id", jid).execute()
         log(f"=== job {jid} DONE {ms}ms ===")
-    except subprocess.TimeoutExpired:
-        fail_job(sb, jid, f"timeout {RENDER_TIMEOUT}s")
+
     except Exception as e:
         log(f"FAILED:\n{traceback.format_exc()}")
         fail_job(sb, jid, str(e)[:2000])
@@ -172,19 +308,27 @@ def process_job(sb, job):
             pass
 
 
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     ensure_env()
     log("starting")
     log(f"supabase: {SUPABASE_URL}")
     log(f"workspace: {WORKSPACE}")
+
+    # LOAD ENGINE ONCE — stays in VRAM forever
+    engine = load_engine()
+
     sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     ensure_bucket(sb)
-    log("ready")
+    log("ready — model in VRAM, waiting for jobs")
+
     while True:
         try:
             job = claim_job(sb)
             if job:
-                process_job(sb, job)
+                process_job(sb, engine, job)
             else:
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
