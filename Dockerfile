@@ -15,20 +15,10 @@ RUN grep -v "^flash\|^pycairo\|^opencv" /tmp/requirements.lock.txt > /tmp/reqs_c
     supabase requests && \
     rm -f /tmp/reqs_clean.txt /tmp/requirements.lock.txt
 
-# Layer 3: FlashAttention 3 Hopper compile (changes rarely, cached aggressively)
-RUN cd /workspace && \
-    git clone https://github.com/Dao-AILab/flash-attention.git && \
-    cd flash-attention && \
-    git checkout v2.6.3 && \
-    git submodule update --init --recursive && \
-    cd hopper && \
-    CUDA_HOME=/usr/local/cuda \
-    PATH=/usr/local/cuda/bin:$PATH \
-    TORCH_CUDA_ARCH_LIST="9.0a" \
-    MAX_JOBS=1 \
-    FLASH_ATTENTION_FORCE_BUILD=TRUE \
-    python3 setup.py install && \
-    cd /workspace && rm -rf flash-attention
+# Layer 3: FlashAttention 3 Hopper (pre-compiled binary, no compile needed)
+COPY prebuilt_fa3/flash_attn_interface.py /usr/local/lib/python3.11/dist-packages/
+COPY prebuilt_fa3/flashattn_hopper_cuda.cpython-311-x86_64-linux-gnu.so /usr/local/lib/python3.11/dist-packages/
+COPY prebuilt_fa3/flashattn_hopper_cuda.py /usr/local/lib/python3.11/dist-packages/
 
 # Layer 4: Startup script (pulls fresh code + checks weights on boot)
 COPY docker-entrypoint.sh /docker-entrypoint.sh
