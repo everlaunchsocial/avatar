@@ -88,6 +88,9 @@ class HunyuanVideoSampler(Inference):
         """
         
         out_dict = dict()
+        video_frame_count = args.sample_n_frames
+        target_length = 129 # The 5-second RoPE window size
+
         wav2vec = wav2vec.to("cuda")
 
         prompt = batch['text_prompt'][0]
