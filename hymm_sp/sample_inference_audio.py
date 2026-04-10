@@ -119,7 +119,7 @@ class HunyuanVideoSampler(Inference):
         pixel_value_ref = batch['pixel_value_ref'].to(self.device)  # (b f c h w) 取值范围[0,255]
         face_masks = get_facemask(pixel_value_ref.clone(), align_instance, area=3.0) 
 
-        pixel_value_ref = pixel_value_ref.clone().repeat(1,video_frame_count,1,1,1)
+        pixel_value_ref = pixel_value_ref.clone().repeat(1,129,1,1,1)
         uncond_pixel_value_ref = torch.zeros_like(pixel_value_ref)
         pixel_value_ref = pixel_value_ref / 127.5 - 1.             
         uncond_pixel_value_ref = uncond_pixel_value_ref * 2 - 1    
