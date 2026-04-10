@@ -43,10 +43,13 @@ echo "  cd $REPO_DIR"
 echo "  CUDA_VISIBLE_DEVICES=0 python3 hymm_sp/sample_gpu_poor.py --input assets/my_test.csv --ckpt ./weights/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt --sample-n-frames 129 --seed 128 --image-size 704 --cfg-scale 7.5 --infer-steps 50 --use-deepcache 1 --flow-shift-eval-video 5.0 --save-path ./results --use-fp8"
 echo ""
 
-# Keep container alive (for RunPod SSH access)
-# If WORKER_MODE is set, run the worker instead
-if [ "$WORKER_MODE" = "true" ]; then
-    echo "Starting worker..."
+# Choose mode based on environment variable
+if [ "$SERVERLESS_MODE" = "true" ]; then
+    echo "Starting RunPod Serverless handler..."
+    cd "$REPO_DIR"
+    python3 scripts/runpod_handler.py
+elif [ "$WORKER_MODE" = "true" ]; then
+    echo "Starting Supabase worker..."
     cd "$REPO_DIR"
     python3 scripts/worker.py
 else

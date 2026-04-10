@@ -12,7 +12,7 @@ RUN grep -v "^flash\|^pycairo\|^opencv" /tmp/requirements.lock.txt > /tmp/reqs_c
     --extra-index-url https://download.pytorch.org/whl/cu124 && \
     pip install --no-cache-dir "numpy<2" opencv-python-headless decord deepcache \
     insightface onnxruntime-gpu moviepy pandas omegaconf timm ftfy sentencepiece \
-    supabase requests && \
+    supabase requests runpod && \
     rm -f /tmp/reqs_clean.txt /tmp/requirements.lock.txt
 
 # Layer 3: FlashAttention 3 Hopper (pre-compiled binary, no compile needed)
