@@ -120,6 +120,7 @@ class HunyuanVideoSampler(Inference):
         face_masks = get_facemask(pixel_value_ref.clone(), align_instance, area=3.0) 
 
         pixel_value_ref = pixel_value_ref.clone().repeat(1,129,1,1,1)
+        pixel_value_ref = pixel_value_ref.clone().repeat(1, 129,1,1,1)
         uncond_pixel_value_ref = torch.zeros_like(pixel_value_ref)
         pixel_value_ref = pixel_value_ref / 127.5 - 1.             
         uncond_pixel_value_ref = uncond_pixel_value_ref * 2 - 1    
@@ -203,6 +204,10 @@ class HunyuanVideoSampler(Inference):
             "cpu_offload": args.cpu_offload
         }
         install_llava_cache(self.pipeline, target_device="cuda")
+        print(f"[DEBUG-30s] audio_prompts.shape={audio_prompts.shape}")
+        print(f"[DEBUG-30s] uncond_audio_prompts.shape={uncond_audio_prompts.shape}")
+        print(f"[DEBUG-30s] video_frame_count={video_frame_count}")
+        print(f"[DEBUG-30s] ref_latents.shape={ref_latents.shape}")
         start_time = time.time()
         samples = self.pipeline(prompt=prompt,                                
                                 height=target_height,

@@ -1078,6 +1078,8 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
         latents_all = latents.clone()
         pad_audio_length = (audio_prompts.shape[1] // 128 + 1) * 128 + 4 - audio_prompts.shape[1]
         audio_prompts_all = torch.cat([audio_prompts, torch.zeros_like(audio_prompts[:, :pad_audio_length])], dim=1)
+        pad_uncond = (uncond_audio_prompts.shape[1] // 128 + 1) * 128 + 4 - uncond_audio_prompts.shape[1]
+        uncond_audio_prompts_all = torch.cat([uncond_audio_prompts, torch.zeros_like(uncond_audio_prompts[:, :pad_uncond])], dim=1)
 
 
         shift = 0
@@ -1118,6 +1120,7 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
 
                     idx_list_audio = [ii % audio_prompts_all.shape[1] for ii in range(index_start * 4, (index_start + frames_per_batch) * 4 - 3)]
                     audio_prompts = audio_prompts_all[:, idx_list_audio].clone()
+                    uncond_audio_prompts = uncond_audio_prompts_all[:, idx_list_audio].clone()
 
                     # expand the latents if we are doing classifier free guidance
                     if self.do_classifier_free_guidance:
