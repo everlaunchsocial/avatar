@@ -102,21 +102,21 @@ class HunyuanVideoSampler(Inference):
         audio_prompts = [encode_audio(wav2vec, audio_feat.to(dtype=wav2vec.dtype), fps.item(), num_frames=batch["audio_len"][0]) for audio_feat in audio_prompts]
         audio_prompts = torch.cat(audio_prompts, dim=0).to(device=self.device, dtype=weight_dtype)
         if audio_prompts.shape[1] <= 129:
-            audio_prompts = torch.cat([audio_prompts, torch.zeros_like(audio_prompts[:, :1]).repeat(1,129-audio_prompts.shape[1], 1, 1, 1)], dim=1)
+            audio_prompts = torch.cat([audio_prompts, torch.zeros_like(audio_prompts[:, :1]).repeat(1,video_frame_count-audio_prompts.shape[1], 1, 1, 1)], dim=1)
         else:
             audio_prompts = torch.cat([audio_prompts, torch.zeros_like(audio_prompts[:, :1]).repeat(1, 5, 1, 1, 1)], dim=1)
         
         # wav2vec.to("cpu")
         torch.cuda.empty_cache()
 
-        uncond_audio_prompts = torch.zeros_like(audio_prompts[:,:129])
+        uncond_audio_prompts = torch.zeros_like(audio_prompts[:,:video_frame_count])
         motion_exp = batch["motion_bucket_id_exps"].to(self.device)
         motion_pose = batch["motion_bucket_id_heads"].to(self.device)
         
         pixel_value_ref = batch['pixel_value_ref'].to(self.device)  # (b f c h w) 取值范围[0,255]
         face_masks = get_facemask(pixel_value_ref.clone(), align_instance, area=3.0) 
 
-        pixel_value_ref = pixel_value_ref.clone().repeat(1,129,1,1,1)
+        pixel_value_ref = pixel_value_ref.clone().repeat(1,video_frame_count,1,1,1)
         uncond_pixel_value_ref = torch.zeros_like(pixel_value_ref)
         pixel_value_ref = pixel_value_ref / 127.5 - 1.             
         uncond_pixel_value_ref = uncond_pixel_value_ref * 2 - 1    
@@ -167,7 +167,8 @@ class HunyuanVideoSampler(Inference):
 
 
         size = (batch['pixel_value_ref'].shape[-2], batch['pixel_value_ref'].shape[-1])
-        target_length = args.sample_n_frames
+        target_length = 129  # window size
+        video_frame_count = args.sample_n_frames  # total duration
         target_height = align_to(size[0], 16)
         target_width = align_to(size[1], 16)
         concat_dict = {'mode': 'timecat', 'bias': -1} 
@@ -203,7 +204,7 @@ class HunyuanVideoSampler(Inference):
         samples = self.pipeline(prompt=prompt,                                
                                 height=target_height,
                                 width=target_width,
-                                frame=target_length,
+                                frame=video_frame_count,
                                 num_inference_steps=args.infer_steps,
                                 guidance_scale=args.cfg_scale,                      # cfg scale
                          
