@@ -175,6 +175,9 @@ def render(engine, image_path, audio_path, output_path, settings):
         fps = batch["fps"]
         audio_path_str = str(batch["audio_path"][0])
 
+        # Ensure wav2vec stays on GPU (predict() may move it to CPU for memory management)
+        wav2vec.to(engine["device"])
+
         # Run prediction — THIS IS THE FAST PART (model already in VRAM)
         start = time.time()
         samples = sampler.predict(args, batch, wav2vec, feature_extractor, align_instance)
