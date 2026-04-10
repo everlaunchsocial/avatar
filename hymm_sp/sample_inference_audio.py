@@ -167,7 +167,7 @@ class HunyuanVideoSampler(Inference):
 
 
         size = (batch['pixel_value_ref'].shape[-2], batch['pixel_value_ref'].shape[-1])
-        target_length = 129
+        target_length = args.sample_n_frames
         target_height = align_to(size[0], 16)
         target_width = align_to(size[1], 16)
         concat_dict = {'mode': 'timecat', 'bias': -1} 
