@@ -64,7 +64,6 @@ def load_engine():
         "--infer-steps", "50",
         "--use-deepcache", "0",
         "--cpu-offload",
-        "--infer-min",
         "--flow-shift-eval-video", "5.0",
         "--save-path", str(WORKSPACE / "results"),
         "--use-fp8",
