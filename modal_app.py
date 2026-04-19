@@ -64,10 +64,11 @@ def download_weights():
     image=image,
     gpu="H100",
     volumes={MODEL_DIR: model_volume},
-    cpu=8,
+    cpu=12,
     memory=65536,
-    scaledown_window=180,   # stay warm 3 min after last job
-    timeout=1800,           # 30 min max per render
+    scaledown_window=180,    # stay warm 3 min after last job
+    timeout=1800,            # 30 min max per render
+    max_containers=10,       # cap parallel renders (raise later if needed)
     secrets=[supabase_secret],
 )
 class AvatarRenderer:
