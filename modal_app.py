@@ -99,6 +99,11 @@ class AvatarRenderer:
         import os, sys, time
         from pathlib import Path as _Path
 
+        # CRITICAL: set CPU_OFFLOAD=1 BEFORE any hymm_sp import.
+        # hymm_sp's text_encoder/vae/models modules read this at import time.
+        os.environ["CPU_OFFLOAD"] = "1"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
         repo_dir = "/workspace/HunyuanVideo-Avatar"
         os.environ["MODEL_BASE"] = MODEL_DIR
         sys.path.insert(0, repo_dir)
