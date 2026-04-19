@@ -6,15 +6,33 @@ WEIGHTS_DIR="$REPO_DIR/weights/ckpts/hunyuan-video-t2v-720p/transformers"
 
 echo "=== EverLaunch Avatar Studio ==="
 
-# Link external weights mount (Verda /mnt/avatar-weights or MODEL_BASE) to expected path
+# Determine external weights source (Verda /mnt/avatar-weights or MODEL_BASE)
 EXTERNAL_WEIGHTS=""
 if [ -n "$MODEL_BASE" ] && [ -d "$MODEL_BASE" ]; then
     EXTERNAL_WEIGHTS="$MODEL_BASE"
 elif [ -d "/mnt/avatar-weights" ]; then
     EXTERNAL_WEIGHTS="/mnt/avatar-weights"
 fi
-if [ -n "$EXTERNAL_WEIGHTS" ]; then
-    mkdir -p "$REPO_DIR"
+
+# Clone or pull code BEFORE creating any subdirectories (git refuses to clone into non-empty dir)
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "Pulling latest code..."
+    cd "$REPO_DIR"
+    git config pull.rebase false
+    git config user.email "pod@everlaunch.local"
+    git config user.name "runpod"
+    git pull origin main 2>/dev/null || echo "Git pull failed - using existing code"
+else
+    # Remove empty placeholder dir if it exists (blocks git clone)
+    [ -d "$REPO_DIR" ] && [ -z "$(ls -A "$REPO_DIR" 2>/dev/null)" ] && rmdir "$REPO_DIR"
+    echo "Cloning repository..."
+    cd /workspace
+    git clone https://github.com/everlaunchsocial/avatar.git HunyuanVideo-Avatar || \
+        echo "Clone failed - check network or repo access"
+fi
+
+# Link external weights into the repo AFTER code is in place
+if [ -n "$EXTERNAL_WEIGHTS" ] && [ -d "$REPO_DIR" ]; then
     if [ -e "$REPO_DIR/weights" ] && [ ! -L "$REPO_DIR/weights" ]; then
         rm -rf "$REPO_DIR/weights"
     fi
@@ -22,21 +40,6 @@ if [ -n "$EXTERNAL_WEIGHTS" ]; then
         ln -s "$EXTERNAL_WEIGHTS" "$REPO_DIR/weights"
         echo "Linked weights: $REPO_DIR/weights -> $EXTERNAL_WEIGHTS"
     fi
-fi
-
-# Pull latest code from GitHub (or clone if first boot)
-if [ -d "$REPO_DIR/.git" ]; then
-    echo "Pulling latest code..."
-    cd "$REPO_DIR"
-    git config pull.rebase false
-    git config user.email "pod@everlaunch.local"
-    git config user.name "runpod"
-    git pull origin main 2>/dev/null || echo "Git pull failed (offline or auth issue) - using existing code"
-else
-    echo "Cloning repository..."
-    cd /workspace
-    git clone https://github.com/everlaunchsocial/avatar.git HunyuanVideo-Avatar 2>/dev/null || \
-    echo "Clone failed - if repo needs auth, clone manually after boot"
 fi
 
 # Check if model weights exist
