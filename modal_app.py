@@ -44,7 +44,6 @@ image = (
         # single-GPU code path that offloads LLaVA (~16GB) to CPU.
         "CPU_OFFLOAD": "1",
         "DISABLE_SP": "1",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
 )
@@ -104,8 +103,9 @@ class AvatarRenderer:
         # hymm_sp's text_encoder/vae/models modules read CPU_OFFLOAD and DISABLE_SP at import time.
         os.environ["CPU_OFFLOAD"] = "1"
         os.environ["DISABLE_SP"] = "1"
-        # expandable_segments alone (max_split_size_mb is incompatible and crashes PyTorch)
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # Removed PYTORCH_CUDA_ALLOC_CONF entirely — expandable_segments was
+        # triggering a PyTorch internal assert. Stick with defaults and rely on
+        # manual eviction + VAE tiling for memory savings.
 
         repo_dir = "/workspace/HunyuanVideo-Avatar"
         os.environ["MODEL_BASE"] = MODEL_DIR
