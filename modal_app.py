@@ -16,17 +16,19 @@ MODEL_DIR = Path("/models")
 # ─────────────────────────────────────────────────────────────
 # CONTAINER IMAGE (pulls our pre-built image with FA3 Hopper)
 # ─────────────────────────────────────────────────────────────
-image = (
-    modal.Image.from_registry("ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8")
-    .env({
-        "MODEL_BASE": str(MODEL_DIR),
-        "HF_HOME": str(MODEL_DIR / "hf"),
-        "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
-        "TOKENIZERS_PARALLELISM": "false",
-        "MASTER_ADDR": "localhost",
-        "MASTER_PORT": "29500",
-    })
-)
+# Your Docker image from private GHCR
+image = modal.Image.from_registry(
+    "ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8",  # ← use your exact current SHA
+    secret=modal.Secret.from_name("github-ghcr2"),
+).env({
+    "WORKER_MODE": "true",
+    "MODEL_BASE": str(MODEL_DIR),
+    "HF_HOME": str(MODEL_DIR / "hf"),
+    "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
+    "TOKENIZERS_PARALLELISM": "false",
+    "MASTER_ADDR": "localhost",
+    "MASTER_PORT": "29500",
+})
 
 # ─────────────────────────────────────────────────────────────
 # SECRETS (create in Modal dashboard as "supabase-keys")
