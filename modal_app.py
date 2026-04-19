@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_cpu_offload_env'",
+        "echo 'cache_bust_low_vram_mode'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -39,10 +39,11 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "MASTER_ADDR": "localhost",
         "MASTER_PORT": "29500",
-        # CRITICAL: Hunyuan's text_encoder/vae/models read CPU_OFFLOAD from the
-        # ENV VAR at import time. The --cpu-offload CLI flag alone doesn't
-        # offload LLaVA (~16GB). This frees enough VRAM to fit the render.
+        # CRITICAL: Hunyuan's text_encoder/vae/models read these from ENV VARS
+        # at import time. Both are needed to trigger the "very low VRAM"
+        # single-GPU code path that offloads LLaVA (~16GB) to CPU.
         "CPU_OFFLOAD": "1",
+        "DISABLE_SP": "1",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
@@ -99,9 +100,11 @@ class AvatarRenderer:
         import os, sys, time
         from pathlib import Path as _Path
 
-        # CRITICAL: set CPU_OFFLOAD=1 BEFORE any hymm_sp import.
-        # hymm_sp's text_encoder/vae/models modules read this at import time.
+        # CRITICAL: set these BEFORE any hymm_sp import.
+        # hymm_sp's text_encoder/vae/models modules read CPU_OFFLOAD and DISABLE_SP at import time.
+        # Both must be 1 to trigger the "very low VRAM" single-GPU code path.
         os.environ["CPU_OFFLOAD"] = "1"
+        os.environ["DISABLE_SP"] = "1"
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
         repo_dir = "/workspace/HunyuanVideo-Avatar"
