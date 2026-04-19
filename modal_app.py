@@ -25,9 +25,10 @@ image = (
     )
     .entrypoint([])
     # Clone the code INTO the image at build time — not at runtime.
-    # This way worker.py and hymm_sp/ are always available at /workspace/HunyuanVideo-Avatar
-    # with no sys.path drama.
+    # The echo with a commit SHA busts Modal's image cache whenever we push new code.
+    # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
+        "echo 'cache_bust_97a9b1e_512res'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
