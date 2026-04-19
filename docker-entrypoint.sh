@@ -6,6 +6,24 @@ WEIGHTS_DIR="$REPO_DIR/weights/ckpts/hunyuan-video-t2v-720p/transformers"
 
 echo "=== EverLaunch Avatar Studio ==="
 
+# Link external weights mount (Verda /mnt/avatar-weights or MODEL_BASE) to expected path
+EXTERNAL_WEIGHTS=""
+if [ -n "$MODEL_BASE" ] && [ -d "$MODEL_BASE" ]; then
+    EXTERNAL_WEIGHTS="$MODEL_BASE"
+elif [ -d "/mnt/avatar-weights" ]; then
+    EXTERNAL_WEIGHTS="/mnt/avatar-weights"
+fi
+if [ -n "$EXTERNAL_WEIGHTS" ]; then
+    mkdir -p "$REPO_DIR"
+    if [ -e "$REPO_DIR/weights" ] && [ ! -L "$REPO_DIR/weights" ]; then
+        rm -rf "$REPO_DIR/weights"
+    fi
+    if [ ! -L "$REPO_DIR/weights" ]; then
+        ln -s "$EXTERNAL_WEIGHTS" "$REPO_DIR/weights"
+        echo "Linked weights: $REPO_DIR/weights -> $EXTERNAL_WEIGHTS"
+    fi
+fi
+
 # Pull latest code from GitHub (or clone if first boot)
 if [ -d "$REPO_DIR/.git" ]; then
     echo "Pulling latest code..."
@@ -44,6 +62,8 @@ echo "  CUDA_VISIBLE_DEVICES=0 python3 hymm_sp/sample_gpu_poor.py --input assets
 echo ""
 
 # Choose mode based on environment variable
+echo "SERVERLESS_MODE=$SERVERLESS_MODE"
+echo "WORKER_MODE=$WORKER_MODE"
 if [ "$SERVERLESS_MODE" = "true" ]; then
     echo "Starting RunPod Serverless handler..."
     cd "$REPO_DIR"
