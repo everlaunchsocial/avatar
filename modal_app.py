@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_384res'",
+        "echo 'cache_bust_512_expandable'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -39,6 +39,10 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "MASTER_ADDR": "localhost",
         "MASTER_PORT": "29500",
+        # Reduce CUDA allocator fragmentation — reclaims the last ~1 GiB
+        # we were missing at 512 resolution. Modal's CUDA stack supports this
+        # even though Verda's didn't.
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
 )

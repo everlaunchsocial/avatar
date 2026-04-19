@@ -59,7 +59,7 @@ def load_engine():
         "--ckpt", f"{MODEL_BASE}/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt",
         "--sample-n-frames", "129",
         "--seed", "128",
-        "--image-size", "384",
+        "--image-size", "512",
         "--cfg-scale", "7.5",
         "--infer-steps", "50",
         "--use-deepcache", "0",
