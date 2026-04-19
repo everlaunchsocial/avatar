@@ -111,9 +111,23 @@ class AvatarRenderer:
             dist.init_process_group(backend="nccl", world_size=1, rank=0)
 
         # Import the real loader from our scripts/worker.py
-        from worker import load_engine
+        try:
+            from worker import load_engine
+        except Exception as e:
+            print(f"DEBUG sys.path: {sys.path}")
+            print(f"DEBUG cwd: {os.getcwd()}")
+            print(f"DEBUG /workspace listing: {os.listdir('/workspace') if os.path.exists('/workspace') else 'MISSING'}")
+            print(f"DEBUG hymm_sp exists: {os.path.isdir(repo_dir + '/hymm_sp')}")
+            print(f"DEBUG hymm_sp/__init__.py exists: {os.path.isfile(repo_dir + '/hymm_sp/__init__.py')}")
+            raise
         start = time.time()
-        self.engine = load_engine()
+        try:
+            self.engine = load_engine()
+        except Exception as e:
+            print(f"DEBUG load_engine() failed — sys.path: {sys.path}")
+            print(f"DEBUG cwd: {os.getcwd()}")
+            print(f"DEBUG hymm_sp exists: {os.path.isdir(repo_dir + '/hymm_sp')}")
+            raise
         print(f"✅ Engine loaded in {time.time() - start:.1f}s, model in VRAM")
 
         # Supabase client for job pickup
