@@ -120,7 +120,6 @@ class HunyuanVideoSampler(Inference):
         face_masks = get_facemask(pixel_value_ref.clone(), align_instance, area=3.0) 
 
         pixel_value_ref = pixel_value_ref.clone().repeat(1,129,1,1,1)
-        pixel_value_ref = pixel_value_ref.clone().repeat(1, 129,1,1,1)
         uncond_pixel_value_ref = torch.zeros_like(pixel_value_ref)
         pixel_value_ref = pixel_value_ref / 127.5 - 1.             
         uncond_pixel_value_ref = uncond_pixel_value_ref * 2 - 1    
