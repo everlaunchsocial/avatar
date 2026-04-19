@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_manual_eviction'",
+        "echo 'cache_bust_no_expandable'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -103,9 +103,10 @@ class AvatarRenderer:
         # hymm_sp's text_encoder/vae/models modules read CPU_OFFLOAD and DISABLE_SP at import time.
         os.environ["CPU_OFFLOAD"] = "1"
         os.environ["DISABLE_SP"] = "1"
-        # Removed PYTORCH_CUDA_ALLOC_CONF entirely — expandable_segments was
-        # triggering a PyTorch internal assert. Stick with defaults and rely on
-        # manual eviction + VAE tiling for memory savings.
+        # Explicitly unset expandable_segments which may be inherited from a
+        # cached image layer. Combining it with max_split_size_mb or certain
+        # allocation patterns triggers a PyTorch internal assert.
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
         repo_dir = "/workspace/HunyuanVideo-Avatar"
         os.environ["MODEL_BASE"] = MODEL_DIR
