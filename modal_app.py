@@ -21,8 +21,12 @@ model_volume = modal.Volume.from_name("everlaunch-avatar-weights", create_if_mis
 image = modal.Image.from_registry(
     "ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8",
     secret=modal.Secret.from_name("github-ghcr2"),
-).env({
-    "WORKER_MODE": "true",
+).entrypoint([]).env({
+    # NOTE: intentionally NOT setting WORKER_MODE here — the baked-in
+    # docker-entrypoint.sh would otherwise auto-run the worker, which
+    # breaks CPU-only jobs like download_weights. The GPU renderer class
+    # calls scripts/worker.py directly in its @modal.enter(), so it doesn't
+    # need the entrypoint script.
     "MODEL_BASE": MODEL_DIR,
     "HF_HOME": MODEL_DIR + "/hf",
     "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
@@ -79,23 +83,31 @@ class AvatarRenderer:
     @modal.enter()
     def load_engine(self):
         """Runs ONCE when the container boots. Loads the full engine into VRAM."""
-        import os, sys, time
+        import os, sys, time, subprocess
         from pathlib import Path as _Path
         os.environ["MODEL_BASE"] = MODEL_DIR
-        sys.path.insert(0, "/workspace/HunyuanVideo-Avatar")
 
-        # Initialize torch distributed (required by the model)
+        # Clone the code repo (entrypoint is disabled, so we do it here)
+        repo_dir = "/workspace/HunyuanVideo-Avatar"
+        if not _Path(repo_dir + "/.git").exists():
+            print(f"Cloning code into {repo_dir}...")
+            subprocess.run(
+                ["git", "clone", "https://github.com/everlaunchsocial/avatar.git", repo_dir],
+                check=True,
+            )
+        sys.path.insert(0, repo_dir)
+
+        # Symlink weights into expected path
+        expected = _Path(repo_dir + "/weights")
+        if not expected.exists():
+            expected.symlink_to(MODEL_DIR)
+            print(f"Linked weights: {expected} -> {MODEL_DIR}")
+
+        # Initialize torch distributed (required by the model, needs GPU)
         import torch
         import torch.distributed as dist
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl", world_size=1, rank=0)
-
-        # Symlink weights into expected path (pathlib is fine here —
-        # this runs inside the Linux container, not on Windows)
-        expected = _Path("/workspace/HunyuanVideo-Avatar/weights")
-        if not expected.exists():
-            expected.symlink_to(MODEL_DIR)
-            print(f"Linked weights: {expected} -> {MODEL_DIR}")
 
         # Import the real loader from our scripts/worker.py
         from scripts.worker import load_engine
