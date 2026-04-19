@@ -18,22 +18,29 @@ model_volume = modal.Volume.from_name("everlaunch-avatar-weights", create_if_mis
 # ─────────────────────────────────────────────────────────────
 # CONTAINER IMAGE (pulls our pre-built image with FA3 Hopper)
 # ─────────────────────────────────────────────────────────────
-image = modal.Image.from_registry(
-    "ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8",
-    secret=modal.Secret.from_name("github-ghcr2"),
-).entrypoint([]).env({
-    # NOTE: intentionally NOT setting WORKER_MODE here — the baked-in
-    # docker-entrypoint.sh would otherwise auto-run the worker, which
-    # breaks CPU-only jobs like download_weights. The GPU renderer class
-    # calls scripts/worker.py directly in its @modal.enter(), so it doesn't
-    # need the entrypoint script.
-    "MODEL_BASE": MODEL_DIR,
-    "HF_HOME": MODEL_DIR + "/hf",
-    "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
-    "TOKENIZERS_PARALLELISM": "false",
-    "MASTER_ADDR": "localhost",
-    "MASTER_PORT": "29500",
-})
+image = (
+    modal.Image.from_registry(
+        "ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8",
+        secret=modal.Secret.from_name("github-ghcr2"),
+    )
+    .entrypoint([])
+    # Clone the code INTO the image at build time — not at runtime.
+    # This way worker.py and hymm_sp/ are always available at /workspace/HunyuanVideo-Avatar
+    # with no sys.path drama.
+    .run_commands(
+        "rm -rf /workspace/HunyuanVideo-Avatar",
+        "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
+    )
+    .env({
+        "MODEL_BASE": MODEL_DIR,
+        "HF_HOME": MODEL_DIR + "/hf",
+        "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
+        "TOKENIZERS_PARALLELISM": "false",
+        "MASTER_ADDR": "localhost",
+        "MASTER_PORT": "29500",
+    })
+    .workdir("/workspace/HunyuanVideo-Avatar")
+)
 
 # ─────────────────────────────────────────────────────────────
 # SECRETS (create in Modal dashboard as "supabase-keys")
@@ -83,37 +90,19 @@ class AvatarRenderer:
     @modal.enter()
     def load_engine(self):
         """Runs ONCE when the container boots. Loads the full engine into VRAM."""
-        import os, sys, time, subprocess
+        import os, sys, time
         from pathlib import Path as _Path
-        os.environ["MODEL_BASE"] = MODEL_DIR
 
-        # Clone the code repo (entrypoint is disabled, so we do it here)
         repo_dir = "/workspace/HunyuanVideo-Avatar"
-        if not _Path(repo_dir + "/.git").exists():
-            print(f"Cloning code into {repo_dir}...")
-            subprocess.run(
-                ["git", "clone", "https://github.com/everlaunchsocial/avatar.git", repo_dir],
-                check=True,
-            )
-        # scripts/ has no __init__.py, so import scripts/worker.py directly by path
+        os.environ["MODEL_BASE"] = MODEL_DIR
         sys.path.insert(0, repo_dir)
         sys.path.insert(0, repo_dir + "/scripts")
-        # Also set PYTHONPATH for any subprocess calls
-        os.environ["PYTHONPATH"] = repo_dir + ":" + os.environ.get("PYTHONPATH", "")
 
-        # Change working directory — some imports in the repo use relative paths
-        os.chdir(repo_dir)
-
-        # Symlink weights into expected path
+        # Symlink weights volume into the repo's expected path
         expected = _Path(repo_dir + "/weights")
         if not expected.exists():
             expected.symlink_to(MODEL_DIR)
             print(f"Linked weights: {expected} -> {MODEL_DIR}")
-
-        # Debug: verify hymm_sp is actually importable before we proceed
-        hymm_dir = _Path(repo_dir) / "hymm_sp"
-        print(f"sys.path[0:3]: {sys.path[:3]}")
-        print(f"hymm_sp exists: {hymm_dir.exists()}, __init__.py: {(hymm_dir / '__init__.py').exists()}")
 
         # Initialize torch distributed (required by the model, needs GPU)
         import torch
