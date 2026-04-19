@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_remove_infer_min'",
+        "echo 'cache_bust_manual_eviction'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -102,10 +102,10 @@ class AvatarRenderer:
 
         # CRITICAL: set these BEFORE any hymm_sp import.
         # hymm_sp's text_encoder/vae/models modules read CPU_OFFLOAD and DISABLE_SP at import time.
-        # Both must be 1 to trigger the "very low VRAM" single-GPU code path.
         os.environ["CPU_OFFLOAD"] = "1"
         os.environ["DISABLE_SP"] = "1"
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # max_split_size_mb forces tighter allocator packing (defragments on the fly)
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
 
         repo_dir = "/workspace/HunyuanVideo-Avatar"
         os.environ["MODEL_BASE"] = MODEL_DIR
@@ -142,7 +142,44 @@ class AvatarRenderer:
             print(f"DEBUG cwd: {os.getcwd()}")
             print(f"DEBUG hymm_sp exists: {os.path.isdir(repo_dir + '/hymm_sp')}")
             raise
-        print(f"✅ Engine loaded in {time.time() - start:.1f}s, model in VRAM")
+        print(f"✅ Engine loaded in {time.time() - start:.1f}s")
+
+        # ─── MANUAL VRAM RECOVERY ─────────────────────────────────
+        # Even with CPU_OFFLOAD=1, modules are loaded on GPU first then
+        # "should" be moved. Force them to CPU now.
+        import gc
+        sampler = self.engine["sampler"]
+
+        # Evict text encoders (LLaVA ~16GB, CLIP ~1GB) to CPU — they only
+        # run at the start of each job, not during the main diffusion.
+        for attr in ("text_encoder", "text_encoder_2"):
+            enc = getattr(sampler, attr, None)
+            if enc is not None and hasattr(enc, "to"):
+                try:
+                    enc.to("cpu")
+                    print(f"Evicted {attr} to CPU")
+                except Exception as e:
+                    print(f"Could not evict {attr}: {e}")
+
+        # Enable VAE tiling+slicing so decode doesn't OOM at the end.
+        # VAE tile sizes are already overridden in worker.load_engine().
+        vae = getattr(sampler, "vae", None) or getattr(getattr(sampler, "pipeline", None), "vae", None)
+        if vae is not None:
+            if hasattr(vae, "enable_tiling"):
+                vae.enable_tiling()
+                print("VAE tiling enabled")
+            if hasattr(vae, "enable_slicing"):
+                vae.enable_slicing()
+                print("VAE slicing enabled")
+
+        # Flush allocator cache so freed VRAM becomes available
+        import torch as _torch
+        gc.collect()
+        _torch.cuda.empty_cache()
+        _torch.cuda.synchronize()
+
+        free, total = _torch.cuda.mem_get_info()
+        print(f"VRAM after eviction: {(total-free)/1024**3:.1f} GiB used / {total/1024**3:.1f} GiB total")
 
         # Supabase client for job pickup
         from supabase import create_client
