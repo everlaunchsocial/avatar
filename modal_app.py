@@ -104,8 +104,8 @@ class AvatarRenderer:
         # hymm_sp's text_encoder/vae/models modules read CPU_OFFLOAD and DISABLE_SP at import time.
         os.environ["CPU_OFFLOAD"] = "1"
         os.environ["DISABLE_SP"] = "1"
-        # max_split_size_mb forces tighter allocator packing (defragments on the fly)
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+        # expandable_segments alone (max_split_size_mb is incompatible and crashes PyTorch)
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
         repo_dir = "/workspace/HunyuanVideo-Avatar"
         os.environ["MODEL_BASE"] = MODEL_DIR
