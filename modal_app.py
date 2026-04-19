@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_512_expandable'",
+        "echo 'cache_bust_cpu_offload_env'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -39,9 +39,10 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "MASTER_ADDR": "localhost",
         "MASTER_PORT": "29500",
-        # Reduce CUDA allocator fragmentation — reclaims the last ~1 GiB
-        # we were missing at 512 resolution. Modal's CUDA stack supports this
-        # even though Verda's didn't.
+        # CRITICAL: Hunyuan's text_encoder/vae/models read CPU_OFFLOAD from the
+        # ENV VAR at import time. The --cpu-offload CLI flag alone doesn't
+        # offload LLaVA (~16GB). This frees enough VRAM to fit the render.
+        "CPU_OFFLOAD": "1",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
