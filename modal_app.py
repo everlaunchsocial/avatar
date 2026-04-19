@@ -98,12 +98,22 @@ class AvatarRenderer:
         # scripts/ has no __init__.py, so import scripts/worker.py directly by path
         sys.path.insert(0, repo_dir)
         sys.path.insert(0, repo_dir + "/scripts")
+        # Also set PYTHONPATH for any subprocess calls
+        os.environ["PYTHONPATH"] = repo_dir + ":" + os.environ.get("PYTHONPATH", "")
+
+        # Change working directory — some imports in the repo use relative paths
+        os.chdir(repo_dir)
 
         # Symlink weights into expected path
         expected = _Path(repo_dir + "/weights")
         if not expected.exists():
             expected.symlink_to(MODEL_DIR)
             print(f"Linked weights: {expected} -> {MODEL_DIR}")
+
+        # Debug: verify hymm_sp is actually importable before we proceed
+        hymm_dir = _Path(repo_dir) / "hymm_sp"
+        print(f"sys.path[0:3]: {sys.path[:3]}")
+        print(f"hymm_sp exists: {hymm_dir.exists()}, __init__.py: {(hymm_dir / '__init__.py').exists()}")
 
         # Initialize torch distributed (required by the model, needs GPU)
         import torch
