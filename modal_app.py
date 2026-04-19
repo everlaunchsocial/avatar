@@ -95,7 +95,9 @@ class AvatarRenderer:
                 ["git", "clone", "https://github.com/everlaunchsocial/avatar.git", repo_dir],
                 check=True,
             )
+        # scripts/ has no __init__.py, so import scripts/worker.py directly by path
         sys.path.insert(0, repo_dir)
+        sys.path.insert(0, repo_dir + "/scripts")
 
         # Symlink weights into expected path
         expected = _Path(repo_dir + "/weights")
@@ -110,7 +112,7 @@ class AvatarRenderer:
             dist.init_process_group(backend="nccl", world_size=1, rank=0)
 
         # Import the real loader from our scripts/worker.py
-        from scripts.worker import load_engine
+        from worker import load_engine
         start = time.time()
         self.engine = load_engine()
         print(f"✅ Engine loaded in {time.time() - start:.1f}s, model in VRAM")
@@ -120,7 +122,7 @@ class AvatarRenderer:
         self.sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
         # Ensure output bucket exists
-        from scripts.worker import ensure_bucket
+        from worker import ensure_bucket
         ensure_bucket(self.sb)
 
     @modal.method()
@@ -137,7 +139,7 @@ class AvatarRenderer:
         self.sb.table("video_jobs").update({"status": "processing"}).eq("id", job_id).execute()
 
         # Reuse the exact process_job logic from scripts/worker.py
-        from scripts.worker import process_job
+        from worker import process_job
         process_job(self.sb, self.engine, job)
 
         # Return updated row for caller convenience
