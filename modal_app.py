@@ -3,27 +3,28 @@ Event-driven: Supabase Edge Function → Modal HTTP call → renders one video �
 Scale-to-zero: container only runs when a job is active.
 """
 import modal
-from pathlib import Path
 
 app = modal.App("everlaunch-avatar")
 
 # ─────────────────────────────────────────────────────────────
 # PERSISTENT VOLUME (holds 50GB of model weights)
 # ─────────────────────────────────────────────────────────────
+# Use explicit POSIX strings (not pathlib) — pathlib produces Windows
+# backslashes when this file runs on Windows and Modal's image builder
+# rejects them as invalid escape sequences.
+MODEL_DIR = "/models"
 model_volume = modal.Volume.from_name("everlaunch-avatar-weights", create_if_missing=True)
-MODEL_DIR = Path("/models")
 
 # ─────────────────────────────────────────────────────────────
 # CONTAINER IMAGE (pulls our pre-built image with FA3 Hopper)
 # ─────────────────────────────────────────────────────────────
-# Your Docker image from private GHCR
 image = modal.Image.from_registry(
-    "ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8",  # ← use your exact current SHA
+    "ghcr.io/everlaunchsocial/avatar:b76e42724415626b4504993597b7f9af484874e8",
     secret=modal.Secret.from_name("github-ghcr2"),
 ).env({
     "WORKER_MODE": "true",
-    "MODEL_BASE": str(MODEL_DIR),
-    "HF_HOME": str(MODEL_DIR / "hf"),
+    "MODEL_BASE": MODEL_DIR,
+    "HF_HOME": MODEL_DIR + "/hf",
     "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
     "TOKENIZERS_PARALLELISM": "false",
     "MASTER_ADDR": "localhost",
@@ -52,7 +53,7 @@ def download_weights():
     import subprocess
     print(f"Downloading HunyuanVideo-Avatar into {MODEL_DIR} ...")
     subprocess.run(
-        ["huggingface-cli", "download", "tencent/HunyuanVideo-Avatar", "--local-dir", str(MODEL_DIR)],
+        ["huggingface-cli", "download", "tencent/HunyuanVideo-Avatar", "--local-dir", MODEL_DIR],
         check=True,
     )
     model_volume.commit()
@@ -79,7 +80,8 @@ class AvatarRenderer:
     def load_engine(self):
         """Runs ONCE when the container boots. Loads the full engine into VRAM."""
         import os, sys, time
-        os.environ["MODEL_BASE"] = str(MODEL_DIR)
+        from pathlib import Path as _Path
+        os.environ["MODEL_BASE"] = MODEL_DIR
         sys.path.insert(0, "/workspace/HunyuanVideo-Avatar")
 
         # Initialize torch distributed (required by the model)
@@ -88,8 +90,9 @@ class AvatarRenderer:
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl", world_size=1, rank=0)
 
-        # Symlink weights into expected path
-        expected = Path("/workspace/HunyuanVideo-Avatar/weights")
+        # Symlink weights into expected path (pathlib is fine here —
+        # this runs inside the Linux container, not on Windows)
+        expected = _Path("/workspace/HunyuanVideo-Avatar/weights")
         if not expected.exists():
             expected.symlink_to(MODEL_DIR)
             print(f"Linked weights: {expected} -> {MODEL_DIR}")
