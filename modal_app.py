@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_force_cuda_device'",
+        "echo 'cache_bust_launch_blocking'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -44,6 +44,10 @@ image = (
         # single-GPU code path that offloads LLaVA (~16GB) to CPU.
         "CPU_OFFLOAD": "1",
         "DISABLE_SP": "1",
+        # Debug: make CUDA errors synchronous so Python tracebacks line up
+        # with the actual failing kernel launch. Safe to leave on while
+        # stabilising; remove once we have a successful render.
+        "CUDA_LAUNCH_BLOCKING": "1",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
 )
