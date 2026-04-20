@@ -54,6 +54,15 @@ def _get_quality_pass_restorer():
     if _QUALITY_PASS_RESTORER is not None:
         return _QUALITY_PASS_RESTORER
     log("quality_pass: initializing GFPGAN + Real-ESRGAN (one-time per container)...")
+
+    # Shim for basicsr <= 1.4.2 referencing torchvision.transforms.functional_tensor,
+    # which was removed in torchvision 0.17+. Alias the old module name to the
+    # current location so the import succeeds. Must happen BEFORE `from gfpgan`
+    # or `from basicsr` since those trigger the missing-module lookup.
+    import sys as _sys
+    import torchvision.transforms.functional as _tvf
+    _sys.modules.setdefault("torchvision.transforms.functional_tensor", _tvf)
+
     from gfpgan import GFPGANer
     from realesrgan import RealESRGANer
     from basicsr.archs.rrdbnet_arch import RRDBNet
