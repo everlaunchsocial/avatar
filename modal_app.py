@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_phase_a_golden_restore'",
+        "echo 'cache_bust_phase_c_motion_damping'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -355,6 +355,8 @@ def render_endpoint(
     image_size: int = None,
     enhance: bool = None,
     color_boost: bool = None,
+    wav2vec_gain: float = None,
+    motion_scale: float = None,
     image_url: str = None,
     audio_url: str = None,
 ):
@@ -388,6 +390,10 @@ def render_endpoint(
         overrides["enhance"] = enhance
     if color_boost is not None:
         overrides["color_boost"] = color_boost
+    if wav2vec_gain is not None:
+        overrides["wav2vec_gain"] = wav2vec_gain
+    if motion_scale is not None:
+        overrides["motion_scale"] = motion_scale
     if image_url is not None:
         overrides["image_url"] = image_url
     if audio_url is not None:

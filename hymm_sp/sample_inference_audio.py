@@ -122,8 +122,28 @@ class HunyuanVideoSampler(Inference):
         # Zero-fill uncond to the same length as audio_prompts to keep them
         # aligned all the way through.
         uncond_audio_prompts = torch.zeros_like(audio_prompts)
+
+        # Phase C: Wav2Vec gain damping — reduces audio signal magnitude so
+        # plosive consonants (B, P, M) don't over-drive the audio-to-video
+        # cross-attention. Without this, B/P words cause "jaw inflation",
+        # "snapping lip", or "winding up" head motion. Value 0.9 per forensic
+        # audit recommendation; 1.0 = no change (original behavior).
+        _wav2vec_gain = float(getattr(args, "wav2vec_gain", 0.9))
+        if _wav2vec_gain != 1.0:
+            audio_prompts = audio_prompts * _wav2vec_gain
+
         motion_exp = batch["motion_bucket_id_exps"].to(self.device)
         motion_pose = batch["motion_bucket_id_heads"].to(self.device)
+
+        # Phase C: Motion bucket scaling — reduces head/expression motion
+        # magnitude so the model doesn't hallucinate motion to "fill" the
+        # timeline. Without this, the model produces "whiplash" head snaps
+        # and "wind-up pauses" on plosive syllables. Value 0.85 (15%
+        # reduction) per forensic audit recommendation; 1.0 = no change.
+        _motion_scale = float(getattr(args, "motion_scale", 0.85))
+        if _motion_scale != 1.0:
+            motion_exp = motion_exp * _motion_scale
+            motion_pose = motion_pose * _motion_scale
         
         pixel_value_ref = batch['pixel_value_ref'].to(self.device)  # (b f c h w) 取值范围[0,255]
         face_masks = get_facemask(pixel_value_ref.clone(), align_instance, area=3.0) 
