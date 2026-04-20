@@ -263,13 +263,24 @@ def render(engine, image_path, audio_path, output_path, settings):
         imageio.mimsave(str(temp_video), video, fps=fps.item())
 
         # Optional color grading at mux time. Hedra/HeyGen output looks
-        # punchier than raw HunyuanVideo-Avatar because they apply a light
-        # grade to the model's "flat / log-style" output. This -vf filter
-        # lifts saturation +20%, contrast +10%, deepens blacks by -0.02.
-        # Near-zero overhead at ffmpeg time. Off by default.
+        # punchier than raw HunyuanVideo-Avatar because they apply a grade
+        # to the model's "flat / log-style" output. First attempt used
+        # mild values (sat+20/con+10) and the user reported "dull, not
+        # enough". Bumping to aggressive values + adding vibrance (which
+        # selectively boosts muted colors over already-saturated ones —
+        # the "Hedra secret" for punch without plastic skin).
+        #
+        # Values:
+        #   saturation=1.4    +40% overall saturation
+        #   contrast=1.18     +18% contrast (deeper blacks, brighter highs)
+        #   brightness=-0.03  deepen midtones slightly
+        #   vibrance=0.4      +40% vibrance — hits muted colors harder
+        #                     than already-vivid ones, so skin/shadows pop
+        #                     without blowing out already-bright pixels
+        # Two filters chained.
         if settings.get("color_boost"):
-            color_filter = "-vf eq=saturation=1.2:contrast=1.1:brightness=-0.02"
-            log("color_boost ffmpeg grade applied (sat+20 / con+10 / bri-0.02)")
+            color_filter = "-vf eq=saturation=1.4:contrast=1.18:brightness=-0.03,vibrance=intensity=0.4"
+            log("color_boost ffmpeg grade applied (sat+40 / con+18 / bri-0.03 / vibrance+40)")
         else:
             color_filter = ""
         os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' {color_filter} -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
