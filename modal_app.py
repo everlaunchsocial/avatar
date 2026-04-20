@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_basicsr_torchvision_shim'",
+        "echo 'cache_bust_qp_modes_versioned_output'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -438,7 +438,7 @@ def render_endpoint(
     color_boost: bool = None,
     wav2vec_gain: float = None,
     motion_scale: float = None,
-    quality_pass: bool = None,
+    quality_pass: str = None,  # accepts: "off" / "face" / "full" (or legacy bool "true"/"false")
     image_url: str = None,
     audio_url: str = None,
 ):

@@ -49,71 +49,73 @@ def log(m):
 # ============================================================
 _QUALITY_PASS_RESTORER = None
 
-def _get_quality_pass_restorer():
-    global _QUALITY_PASS_RESTORER
-    if _QUALITY_PASS_RESTORER is not None:
-        return _QUALITY_PASS_RESTORER
-    log("quality_pass: initializing GFPGAN + Real-ESRGAN (one-time per container)...")
+# Cache keyed by mode: "face" (GFPGAN only, no upscale, no trails) or
+# "full" (GFPGAN + Real-ESRGAN 2x upscale, sharper but per-frame ghosting
+# risk on fast motion). Lazy-init per mode, reused across renders.
+_QUALITY_PASS_RESTORERS = {}
+
+def _get_quality_pass_restorer(mode):
+    """mode = 'face' (GFPGAN only) or 'full' (GFPGAN + Real-ESRGAN 2x)."""
+    if mode in _QUALITY_PASS_RESTORERS:
+        return _QUALITY_PASS_RESTORERS[mode]
+    log(f"quality_pass[{mode}]: initializing (one-time per container)...")
 
     # Shim for basicsr <= 1.4.2 referencing torchvision.transforms.functional_tensor,
     # which was removed in torchvision 0.17+. Alias the old module name to the
-    # current location so the import succeeds. Must happen BEFORE `from gfpgan`
-    # or `from basicsr` since those trigger the missing-module lookup.
+    # current location so the import succeeds.
     import sys as _sys
     import torchvision.transforms.functional as _tvf
     _sys.modules.setdefault("torchvision.transforms.functional_tensor", _tvf)
 
     from gfpgan import GFPGANer
-    from realesrgan import RealESRGANer
-    from basicsr.archs.rrdbnet_arch import RRDBNet
 
     weights_dir = Path("/models/cache/gfpgan")
     gfpgan_path = weights_dir / "GFPGANv1.4.pth"
-    esrgan_path = weights_dir / "RealESRGAN_x2plus.pth"
     if not gfpgan_path.exists():
         raise RuntimeError(
             f"GFPGAN weights not found at {gfpgan_path}. "
             f"Run: modal run modal_app.py::download_quality_weights"
         )
-    if not esrgan_path.exists():
-        raise RuntimeError(
-            f"Real-ESRGAN weights not found at {esrgan_path}. "
-            f"Run: modal run modal_app.py::download_quality_weights"
+
+    bg_upsampler = None
+    if mode == "full":
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        esrgan_path = weights_dir / "RealESRGAN_x2plus.pth"
+        if not esrgan_path.exists():
+            raise RuntimeError(
+                f"Real-ESRGAN weights not found at {esrgan_path}. "
+                f"Run: modal run modal_app.py::download_quality_weights"
+            )
+        esrgan_model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                                num_block=23, num_grow_ch=32, scale=2)
+        bg_upsampler = RealESRGANer(
+            scale=2, model_path=str(esrgan_path), model=esrgan_model,
+            tile=400, tile_pad=10, pre_pad=0, half=True,
         )
 
-    esrgan_model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                            num_block=23, num_grow_ch=32, scale=2)
-    bg_upsampler = RealESRGANer(
-        scale=2,
-        model_path=str(esrgan_path),
-        model=esrgan_model,
-        tile=400,
-        tile_pad=10,
-        pre_pad=0,
-        half=True,
-    )
+    # upscale=2 only matters if bg_upsampler is set (full mode);
+    # in face mode the output stays at original resolution.
+    upscale_factor = 2 if mode == "full" else 1
     restorer = GFPGANer(
         model_path=str(gfpgan_path),
-        upscale=2,
+        upscale=upscale_factor,
         arch="clean",
         channel_multiplier=2,
         bg_upsampler=bg_upsampler,
     )
-    _QUALITY_PASS_RESTORER = restorer
-    log("quality_pass: GFPGAN + Real-ESRGAN ready.")
+    _QUALITY_PASS_RESTORERS[mode] = restorer
+    log(f"quality_pass[{mode}]: ready (bg_upsampler={'Real-ESRGAN' if bg_upsampler else 'None'}).")
     return restorer
 
 
-def _apply_quality_pass(video_frames_rgb):
-    """Run GFPGAN face restoration + Real-ESRGAN 2x upscale on each frame.
-    Input: numpy array (F, H, W, C) RGB uint8.
-    Output: numpy array (F, 2H, 2W, C) RGB uint8 — upscaled + restored.
-    """
+def _apply_quality_pass(video_frames_rgb, mode):
+    """mode='face' -> GFPGAN face restore only, original resolution.
+       mode='full' -> GFPGAN + Real-ESRGAN 2x upscale (can show ghosting on motion)."""
     import cv2
-    restorer = _get_quality_pass_restorer()
+    restorer = _get_quality_pass_restorer(mode)
     out_frames = []
     for frame_rgb in video_frames_rgb:
-        # GFPGAN expects BGR
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         _cropped, _restored_faces, restored_bgr = restorer.enhance(
             frame_bgr,
@@ -121,7 +123,6 @@ def _apply_quality_pass(video_frames_rgb):
             only_center_face=False,
             paste_back=True,
         )
-        # Back to RGB for imageio/ffmpeg
         restored_rgb = cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
         out_frames.append(restored_rgb)
     return np.stack(out_frames, axis=0)
@@ -396,13 +397,33 @@ def render(engine, image_path, audio_path, output_path, settings):
         # 30s video). Provides the "80% closer to Hedra" quality jump on
         # face detail and shirt/logo/eye texture. Falls back gracefully
         # if models aren't downloaded or dependencies missing.
-        if settings.get("quality_pass"):
+        # Normalize quality_pass value:
+        #   "off" / "false" / "none" / False / None / missing = off
+        #   "face" = GFPGAN face restore only, original resolution, no trails
+        #   "full" / "true" / True = GFPGAN + Real-ESRGAN 2x (sharper but
+        #                             per-frame ghost risk on fast motion)
+        _qp = settings.get("quality_pass", "off")
+        if isinstance(_qp, bool):
+            _qp_mode = "full" if _qp else "off"
+        else:
+            _qp_str = str(_qp).strip().lower()
+            if _qp_str in ("off", "false", "none", "0", ""):
+                _qp_mode = "off"
+            elif _qp_str in ("face", "face_only"):
+                _qp_mode = "face"
+            elif _qp_str in ("full", "true", "1"):
+                _qp_mode = "full"
+            else:
+                log(f"quality_pass: unknown value {_qp!r}, treating as off")
+                _qp_mode = "off"
+
+        if _qp_mode != "off":
             try:
                 t0 = time.time()
-                video = _apply_quality_pass(video)
-                log(f"quality_pass: GFPGAN+ESRGAN processed {len(video)} frames in {time.time()-t0:.1f}s")
+                video = _apply_quality_pass(video, _qp_mode)
+                log(f"quality_pass[{_qp_mode}]: processed {len(video)} frames in {time.time()-t0:.1f}s")
             except Exception as _qe:
-                log(f"quality_pass FAILED — continuing without: {_qe}")
+                log(f"quality_pass[{_qp_mode}] FAILED — continuing without: {_qe}")
 
         # Save video
         temp_video = output_path.parent / "temp_video.mp4"
@@ -569,19 +590,43 @@ def process_job(sb, engine, job):
 
         log(f"output: {video_path.name} ({video_path.stat().st_size} bytes)")
 
-        # Upload to Supabase
-        sp = f"{jid}.mp4"
+        # Upload to Supabase. Each render gets a UNIQUE versioned filename
+        # so prior renders at the same job_id are PRESERVED for A/B comparison.
+        # Format: {jid}/v-{UTC_ISO_timestamp}-{qp_mode}.mp4
+        # Also write a {jid}.mp4 "latest" alias pointing at this version so
+        # any Lovable UI that assumes the flat filename keeps working.
+        _ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        _qp_tag = _qp_mode if _qp_mode in ("face", "full") else "noqp"
+        versioned_sp = f"{jid}/v-{_ts}-qp_{_qp_tag}.mp4"
+        latest_sp = f"{jid}.mp4"
         fb = video_path.read_bytes()
+        # 1) Upload versioned filename (never overwritten)
         try:
-            sb.storage.from_(BUCKET).upload(path=sp, file=fb, file_options={"content-type": "video/mp4", "upsert": "true"})
+            sb.storage.from_(BUCKET).upload(
+                path=versioned_sp, file=fb,
+                file_options={"content-type": "video/mp4", "upsert": "false"},
+            )
         except Exception:
             ensure_bucket(sb)
-            sb.storage.from_(BUCKET).upload(path=sp, file=fb, file_options={"content-type": "video/mp4", "upsert": "true"})
+            sb.storage.from_(BUCKET).upload(
+                path=versioned_sp, file=fb,
+                file_options={"content-type": "video/mp4", "upsert": "false"},
+            )
+        # 2) Also overwrite the flat {jid}.mp4 alias for Lovable's UI.
+        try:
+            sb.storage.from_(BUCKET).upload(
+                path=latest_sp, file=fb,
+                file_options={"content-type": "video/mp4", "upsert": "true"},
+            )
+        except Exception as _e:
+            log(f"latest alias upload failed (non-fatal): {_e}")
 
-        pu = sb.storage.from_(BUCKET).get_public_url(sp)
+        # Use versioned URL in DB so each render row can be traced to its
+        # exact output. Lovable UI can still hit the flat URL if it wants.
+        pu = sb.storage.from_(BUCKET).get_public_url(versioned_sp)
         ms = int((time.time() - start) * 1000)
         sb.table("video_jobs").update({"status": "done", "output_url": pu, "render_time_ms": ms}).eq("id", jid).execute()
-        log(f"=== job {jid} DONE {ms}ms ===")
+        log(f"=== job {jid} DONE {ms}ms versioned={versioned_sp} ===")
 
     except Exception as e:
         log(f"FAILED:\n{traceback.format_exc()}")
