@@ -59,7 +59,7 @@ def load_engine():
         "--ckpt", f"{MODEL_BASE}/ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_fp8.pt",
         "--sample-n-frames", "129",
         "--seed", "128",
-        "--image-size", "704",
+        "--image-size", "512",
         "--cfg-scale", "7.5",
         "--infer-steps", "50",
         "--use-deepcache", "0",
@@ -143,9 +143,11 @@ def render(engine, image_path, audio_path, output_path, settings):
     args.sample_n_frames = FMAP.get(length, 129)
     seed_val = settings.get("seed")
     args.seed = int(seed_val) if seed_val not in (None, "", 0) else 128
-    # Per-request resolution. 704 is the RunPod-validated "good" baseline.
-    # Drop to 512 or 336 to cut render time / VRAM at the cost of detail.
-    args.image_size = int(settings.get("image_size", 704))
+    # Per-request resolution. 512 is the Modal-validated working default
+    # (5-step + 512 produces clean eyes and no shape errors). 704 triggers
+    # a latent shape-mismatch bug in the pipeline that we still need to fix;
+    # pass image_size=704 explicitly only for testing once that bug is fixed.
+    args.image_size = int(settings.get("image_size", 512))
 
     # Update TeaCache for current step count
     tc = sampler.model
