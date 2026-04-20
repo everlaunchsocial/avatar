@@ -212,6 +212,16 @@ def render(engine, image_path, audio_path, output_path, settings):
 
     # Create temporary CSV for the dataset loader
     prompt = (settings.get("prompt") or "A person speaking naturally and confidently").replace(",", " ").strip()
+
+    # Color-boost prompt modifiers — when enabled, secretly append the
+    # "quality modifiers" that commercial platforms (Hedra, HeyGen) use
+    # to nudge the diffusion model into producing more saturated, more
+    # cinematically-graded output. Off by default so existing prompts
+    # stay verbatim unless the operator opts in.
+    if settings.get("color_boost"):
+        color_modifiers = " vibrant colors cinematic lighting high contrast professional color grading detailed skin textures rich saturation"
+        prompt = f"{prompt}{color_modifiers}".strip()
+        log(f"color_boost prompt modifiers appended")
     csv_path = image_path.parent / "input.csv"
     csv_path.write_text(f"videoid,image,audio,prompt,fps\n1,{image_path},{audio_path},{prompt},25\n")
 
@@ -251,7 +261,18 @@ def render(engine, image_path, audio_path, output_path, settings):
         # Save video
         temp_video = output_path.parent / "temp_video.mp4"
         imageio.mimsave(str(temp_video), video, fps=fps.item())
-        os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
+
+        # Optional color grading at mux time. Hedra/HeyGen output looks
+        # punchier than raw HunyuanVideo-Avatar because they apply a light
+        # grade to the model's "flat / log-style" output. This -vf filter
+        # lifts saturation +20%, contrast +10%, deepens blacks by -0.02.
+        # Near-zero overhead at ffmpeg time. Off by default.
+        if settings.get("color_boost"):
+            color_filter = "-vf eq=saturation=1.2:contrast=1.1:brightness=-0.02"
+            log("color_boost ffmpeg grade applied (sat+20 / con+10 / bri-0.02)")
+        else:
+            color_filter = ""
+        os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' {color_filter} -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
 
         return output_path, render_time
 
