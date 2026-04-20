@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_revert_to_512'",
+        "echo 'cache_bust_add_poller'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -242,8 +242,79 @@ class AvatarRenderer:
 
 
 # ─────────────────────────────────────────────────────────────
+# BACKGROUND POLLER — scans Supabase `video_jobs` every 30 seconds
+# for any pending rows and fires a render for each.
+#
+# This bridges Lovable's pull-based architecture (insert a row,
+# wait for a worker to pick it up) with Modal's compute. You do
+# NOT need to call the HTTP endpoint below from Lovable — just
+# drop rows into `video_jobs` with status='pending' and this
+# cron will spawn a render container within ~30 seconds.
+#
+# Also cleans up stuck rows: anything in 'processing' that hasn't
+# updated for 30+ minutes is marked failed so it stops blocking
+# the UI from creating a new render for the same affiliate.
+# ─────────────────────────────────────────────────────────────
+@app.function(
+    image=image,
+    secrets=[supabase_secret],
+    schedule=modal.Period(seconds=30),
+    timeout=60,
+    max_containers=1,  # serialize polls so we don't double-fire jobs
+)
+def poll_pending_jobs():
+    """Runs every 30 seconds. Claims pending rows and spawns renders."""
+    import os
+    from datetime import datetime, timezone, timedelta
+    from supabase import create_client
+
+    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+
+    # --- 1. Sweep stale 'processing' rows (older than 30 min) to failed.
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    try:
+        stale = sb.table("video_jobs").select("id,updated_at,created_at").eq("status", "processing").lt("updated_at", cutoff).execute()
+        for row in (stale.data or []):
+            print(f"[poll] sweeping stale processing row {row['id']} (updated_at={row.get('updated_at')})")
+            sb.table("video_jobs").update({
+                "status": "failed",
+                "error_message": "Timed out — worker did not complete within 30 minutes",
+            }).eq("id", row["id"]).eq("status", "processing").execute()
+    except Exception as e:
+        # updated_at may not exist in some schemas — fall back silently.
+        print(f"[poll] stale-sweep skipped: {e}")
+
+    # --- 2. Find pending rows and spawn renders for each.
+    res = sb.table("video_jobs").select("id,created_at").eq("status", "pending").order("created_at").limit(10).execute()
+    pending = res.data or []
+    if not pending:
+        return {"pending": 0, "fired": 0}
+
+    renderer = AvatarRenderer()
+    fired = 0
+    for row in pending:
+        jid = row["id"]
+        # Atomic claim: flip to processing only if still pending, to prevent
+        # a second poll (or another worker) from double-firing the same row.
+        claim = sb.table("video_jobs").update({"status": "processing"}).eq("id", jid).eq("status", "pending").execute()
+        if not claim.data:
+            print(f"[poll] skipped {jid} (already claimed)")
+            continue
+        print(f"[poll] firing render for {jid}")
+        renderer.render_job.spawn(jid)
+        fired += 1
+
+    return {"pending": len(pending), "fired": fired}
+
+
+# ─────────────────────────────────────────────────────────────
 # HTTP ENDPOINT — Supabase Edge Function POSTs to this URL
 # After deploy, URL is: https://<your-workspace>--everlaunch-avatar-render-endpoint.modal.run
+#
+# Optional path. With the poller above running, you do not need
+# to call this from Lovable — the poller picks up pending rows
+# automatically. This endpoint remains for manual/CLI testing
+# and for overriding settings per-request.
 # ─────────────────────────────────────────────────────────────
 @app.function(
     image=image,
