@@ -28,13 +28,29 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_phase_c_motion_damping'",
+        "echo 'cache_bust_all_improvements_phase_b'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
+    # Phase B: pinned AI upscale/restore deps for the optional
+    # quality_pass flag (GFPGAN for face restoration + Real-ESRGAN for
+    # general upscale). Versions pinned per forensic audit Report 3 #8:
+    # these specific versions are known-compatible with torch 2.5.1 and
+    # the basicsr shared dep. Do NOT bump without re-verifying the pin.
+    .pip_install([
+        "gfpgan==1.3.8",
+        "realesrgan==0.3.0",
+        "basicsr==1.4.2",
+        "facexlib==0.3.0",
+    ])
     .env({
         "MODEL_BASE": MODEL_DIR,
         "HF_HOME": MODEL_DIR + "/hf",
+        # TORCH_HOME on persistent volume so GFPGAN/facexlib auxiliary
+        # weights (~100MB detector + parser nets) don't re-download on
+        # every cold start. Default would be ~/.cache/torch/hub/
+        # (ephemeral). Pre-populated by download_quality_weights.
+        "TORCH_HOME": MODEL_DIR + "/cache/torch_hub",
         "PYTHONPATH": "/workspace/HunyuanVideo-Avatar",
         "TOKENIZERS_PARALLELISM": "false",
         "MASTER_ADDR": "localhost",
@@ -83,6 +99,71 @@ def download_weights():
     )
     model_volume.commit()
     print("✅ Weights committed to Volume")
+
+
+# ─────────────────────────────────────────────────────────────
+# ONE-TIME: Download GFPGAN + Real-ESRGAN weights for quality_pass.
+# Run: `modal run modal_app.py::download_quality_weights`
+# Weights live on the same Modal Volume as the main model,
+# persistent across container restarts.
+# ─────────────────────────────────────────────────────────────
+@app.function(
+    image=image,
+    volumes={MODEL_DIR: model_volume},
+    timeout=600,
+    cpu=2,
+    memory=8192,
+)
+def download_quality_weights():
+    import os
+    import urllib.request
+    import ssl
+    dest_dir = f"{MODEL_DIR}/cache/gfpgan"
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # GFPGAN / Real-ESRGAN go in /models/cache/gfpgan
+    # facexlib helpers (used internally by GFPGAN for face detection)
+    # must live at $TORCH_HOME/checkpoints because that's where
+    # facexlib.utils.load_file_from_url looks (via torch.hub).
+    torch_hub_checkpoints = f"{MODEL_DIR}/cache/torch_hub/checkpoints"
+    os.makedirs(torch_hub_checkpoints, exist_ok=True)
+
+    targets = [
+        # (filename, url, destination_dir)
+        ("GFPGANv1.4.pth",
+         "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
+         dest_dir),
+        ("RealESRGAN_x2plus.pth",
+         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+         dest_dir),
+        ("detection_Resnet50_Final.pth",
+         "https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth",
+         torch_hub_checkpoints),
+        ("parsing_parsenet.pth",
+         "https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth",
+         torch_hub_checkpoints),
+    ]
+
+    ctx = ssl.create_default_context()
+    for fname, url, target_dir in targets:
+        target = os.path.join(target_dir, fname)
+        if os.path.exists(target) and os.path.getsize(target) > 1024 * 1024:
+            size_mb = os.path.getsize(target) / (1024 * 1024)
+            print(f"✅ {fname} already present ({size_mb:.1f} MB) at {target_dir}")
+            continue
+        print(f"⬇️  Downloading {fname} → {target_dir}")
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, context=ctx) as r, open(target, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        size_mb = os.path.getsize(target) / (1024 * 1024)
+        print(f"✅ {fname} saved ({size_mb:.1f} MB)")
+
+    model_volume.commit()
+    print(f"✅ All quality_pass weights committed to volume")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -357,6 +438,7 @@ def render_endpoint(
     color_boost: bool = None,
     wav2vec_gain: float = None,
     motion_scale: float = None,
+    quality_pass: bool = None,
     image_url: str = None,
     audio_url: str = None,
 ):
@@ -394,6 +476,8 @@ def render_endpoint(
         overrides["wav2vec_gain"] = wav2vec_gain
     if motion_scale is not None:
         overrides["motion_scale"] = motion_scale
+    if quality_pass is not None:
+        overrides["quality_pass"] = quality_pass
     if image_url is not None:
         overrides["image_url"] = image_url
     if audio_url is not None:

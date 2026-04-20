@@ -8,7 +8,10 @@ import functools
 import torch
 
 LLAVA_CACHE_ENABLED = True
-LLAVA_CACHE_DIR = "/workspace/HunyuanVideo-Avatar/cache/llava_embeddings"
+# Moved to persistent Modal Volume (was /workspace which is EPHEMERAL).
+# Every deploy wiped the cache, causing 17-sec LLaVA re-encode on first
+# render after code pushes. Now on the everlaunch-avatar-weights volume.
+LLAVA_CACHE_DIR = "/models/cache/llava_embeddings"
 LLAVA_CACHE_MAX_MB = 4096
 LLAVA_CACHE_LOG = True
 

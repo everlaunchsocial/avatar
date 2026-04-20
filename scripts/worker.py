@@ -40,6 +40,85 @@ def log(m):
 
 
 # ============================================================
+# PHASE B: AI QUALITY PASS (GFPGAN face restoration + Real-ESRGAN
+# upscale). Lazy-initialized once per container, reused across renders
+# for amortization. Models live on Modal Volume at /models/cache/gfpgan/
+# (pre-downloaded via download_quality_weights one-off function in
+# modal_app.py). Processing cost: ~0.3-0.5 sec/frame on H100.
+# Falls back gracefully if dependencies or weights are missing.
+# ============================================================
+_QUALITY_PASS_RESTORER = None
+
+def _get_quality_pass_restorer():
+    global _QUALITY_PASS_RESTORER
+    if _QUALITY_PASS_RESTORER is not None:
+        return _QUALITY_PASS_RESTORER
+    log("quality_pass: initializing GFPGAN + Real-ESRGAN (one-time per container)...")
+    from gfpgan import GFPGANer
+    from realesrgan import RealESRGANer
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+
+    weights_dir = Path("/models/cache/gfpgan")
+    gfpgan_path = weights_dir / "GFPGANv1.4.pth"
+    esrgan_path = weights_dir / "RealESRGAN_x2plus.pth"
+    if not gfpgan_path.exists():
+        raise RuntimeError(
+            f"GFPGAN weights not found at {gfpgan_path}. "
+            f"Run: modal run modal_app.py::download_quality_weights"
+        )
+    if not esrgan_path.exists():
+        raise RuntimeError(
+            f"Real-ESRGAN weights not found at {esrgan_path}. "
+            f"Run: modal run modal_app.py::download_quality_weights"
+        )
+
+    esrgan_model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                            num_block=23, num_grow_ch=32, scale=2)
+    bg_upsampler = RealESRGANer(
+        scale=2,
+        model_path=str(esrgan_path),
+        model=esrgan_model,
+        tile=400,
+        tile_pad=10,
+        pre_pad=0,
+        half=True,
+    )
+    restorer = GFPGANer(
+        model_path=str(gfpgan_path),
+        upscale=2,
+        arch="clean",
+        channel_multiplier=2,
+        bg_upsampler=bg_upsampler,
+    )
+    _QUALITY_PASS_RESTORER = restorer
+    log("quality_pass: GFPGAN + Real-ESRGAN ready.")
+    return restorer
+
+
+def _apply_quality_pass(video_frames_rgb):
+    """Run GFPGAN face restoration + Real-ESRGAN 2x upscale on each frame.
+    Input: numpy array (F, H, W, C) RGB uint8.
+    Output: numpy array (F, 2H, 2W, C) RGB uint8 — upscaled + restored.
+    """
+    import cv2
+    restorer = _get_quality_pass_restorer()
+    out_frames = []
+    for frame_rgb in video_frames_rgb:
+        # GFPGAN expects BGR
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        _cropped, _restored_faces, restored_bgr = restorer.enhance(
+            frame_bgr,
+            has_aligned=False,
+            only_center_face=False,
+            paste_back=True,
+        )
+        # Back to RGB for imageio/ffmpeg
+        restored_rgb = cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
+        out_frames.append(restored_rgb)
+    return np.stack(out_frames, axis=0)
+
+
+# ============================================================
 # PHOTO ENHANCEMENT (for "sunrise/sundowning" temporal lighting
 # drift). Proven fix from previous RunPod testing:
 #
@@ -225,8 +304,11 @@ def render(engine, image_path, audio_path, output_path, settings):
     args.cfg_scale = float(settings.get("cfg_scale", 4.0))
     args.flow_shift_eval_video = float(settings.get("flow_shift", 3.0))
     # Phase C motion/audio damping (fixes B/P plosive over-amplification)
-    args.wav2vec_gain = float(settings.get("wav2vec_gain", 0.9))
-    args.motion_scale = float(settings.get("motion_scale", 0.85))
+    # Damping cranked from 0.9/0.85 → 0.75/0.7 based on user feedback
+    # ("jaw inflation and head whiplash still visible" at mild values).
+    # Override per-render via URL params / settings JSON.
+    args.wav2vec_gain = float(settings.get("wav2vec_gain", 0.75))
+    args.motion_scale = float(settings.get("motion_scale", 0.7))
     length = settings.get("video_length", "5s")
     args.sample_n_frames = FMAP.get(length, 129)
     seed_val = settings.get("seed")
@@ -299,6 +381,20 @@ def render(engine, image_path, audio_path, output_path, settings):
 
         torch.cuda.empty_cache()
 
+        # Phase B: Optional AI quality pass — GFPGAN face restoration +
+        # Real-ESRGAN upscale. Opt-in via settings.quality_pass=true. Adds
+        # ~0.3-0.5 sec/frame on H100 (so ~40s for 5-sec video, ~4 min for
+        # 30s video). Provides the "80% closer to Hedra" quality jump on
+        # face detail and shirt/logo/eye texture. Falls back gracefully
+        # if models aren't downloaded or dependencies missing.
+        if settings.get("quality_pass"):
+            try:
+                t0 = time.time()
+                video = _apply_quality_pass(video)
+                log(f"quality_pass: GFPGAN+ESRGAN processed {len(video)} frames in {time.time()-t0:.1f}s")
+            except Exception as _qe:
+                log(f"quality_pass FAILED — continuing without: {_qe}")
+
         # Save video
         temp_video = output_path.parent / "temp_video.mp4"
         imageio.mimsave(str(temp_video), video, fps=fps.item())
@@ -320,19 +416,28 @@ def render(engine, image_path, audio_path, output_path, settings):
         #                     without blowing out already-bright pixels
         # Two filters chained.
         if settings.get("color_boost", True):
-            # Post-render quality pass — three stages at mux time:
-            #   1. 2x upscale via Lanczos (cleaner edges, no AI required)
-            #   2. Unsharp mask (restores perceived detail lost to VAE decode)
-            #   3. Color grade (saturation + contrast, no vibrance — was orange)
-            # Roughly 30% of the way to Hedra-level perceived quality
-            # without any new dependencies. Path B (Real-ESRGAN + GFPGAN)
-            # goes significantly further but requires container rebuild.
+            # Post-render quality pass — stacked ffmpeg filter chain:
+            #   1. 2x Lanczos upscale (cleaner edges, no AI required)
+            #   2. Unsharp mask wide-radius (broad edge detail — per audit
+            #      this alone gets ~30% of the way to Hedra)
+            #   3. Unsharp mask narrow-radius (fine texture — "Laplacian-
+            #      style" multi-scale sharpening per AI #1 recommendation +
+            #      audit backlog item #3 "Laplacian sharpening on final
+            #      frames — Fixes logo/shirt floating; cheap, deterministic")
+            #   4. Film-style tone curve — lifts shadows gently, rolloff
+            #      highlights to prevent clipping, gives "Hedra-pop" without
+            #      the flat linear contrast of pure eq filter (audit #2 LUT)
+            #   5. Color grade (saturation + contrast) for final punch
             color_filter = (
                 "-vf scale=iw*2:ih*2:flags=lanczos,"
-                "unsharp=5:5:0.9:5:5:0.4,"
+                "unsharp=7:7:0.8:5:5:0.4,"         # wide sharpen — edges
+                "unsharp=3:3:0.4:3:3:0.2,"         # narrow sharpen — fine detail
+                "curves=r='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1':"
+                "g='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1':"
+                "b='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1',"  # subtle S-curve
                 "eq=saturation=1.25:contrast=1.12:brightness=-0.02"
             )
-            log("color_boost applied: 2x upscale + unsharp + sat+25/con+12/bri-0.02")
+            log("color_boost applied: 2x upscale + multi-scale sharpen + film curve + sat+25/con+12")
         else:
             color_filter = ""
         os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' {color_filter} -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")

@@ -13,7 +13,8 @@ from hymm_sp.data_kits.audio_preprocessor import encode_audio, get_facemask
 import hashlib
 import os as _cache_os
 from hymm_sp.llava_cache_monkey_patch import install_llava_cache, print_cache_stats
-CACHE_DIR = "/workspace/HunyuanVideo-Avatar/cache/embeddings"
+# VAE latent cache on persistent Modal Volume (was /workspace, ephemeral).
+CACHE_DIR = "/models/cache/vae_embeddings"
 _cache_os.makedirs(CACHE_DIR, exist_ok=True)
 
 def align_to(value, alignment):
