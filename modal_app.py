@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_settings_override'",
+        "echo 'cache_bust_704_default'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -261,6 +261,7 @@ def render_endpoint(
     teacache_threshold: float = None,
     seed: int = None,
     prompt: str = None,
+    image_size: int = None,
 ):
     """POST /?job_id=<uuid>[&inference_steps=30&cfg_scale=6.5&...]
 
@@ -286,6 +287,8 @@ def render_endpoint(
         overrides["seed"] = seed
     if prompt is not None:
         overrides["prompt"] = prompt
+    if image_size is not None:
+        overrides["image_size"] = image_size
 
     renderer = AvatarRenderer()
     result = renderer.render_job.remote(job_id, overrides or None)
