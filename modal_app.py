@@ -385,3 +385,46 @@ def render_endpoint(
     renderer = AvatarRenderer()
     result = renderer.render_job.remote(job_id, overrides or None)
     return result
+
+
+# ─────────────────────────────────────────────────────────────
+# DIAGNOSTIC — GET /?job_id=<uuid> returns the full row so we can
+# see exactly what settings a render was fired with. Read-only.
+# ─────────────────────────────────────────────────────────────
+@app.function(
+    image=image,
+    secrets=[supabase_secret],
+    timeout=30,
+)
+@modal.fastapi_endpoint(method="GET")
+def job_info(job_id: str):
+    """GET /?job_id=<uuid> — returns the full video_jobs row. Read-only."""
+    import os
+    from supabase import create_client
+    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    res = sb.table("video_jobs").select("*").eq("id", job_id).execute()
+    if not res.data:
+        return {"error": f"job {job_id} not found"}
+    return res.data[0]
+
+
+# ─────────────────────────────────────────────────────────────
+# DIAGNOSTIC — GET /recent returns the last N jobs with their
+# full settings so we can audit what configs produced good/bad
+# outputs without digging through rotating logs.
+# ─────────────────────────────────────────────────────────────
+@app.function(
+    image=image,
+    secrets=[supabase_secret],
+    timeout=30,
+)
+@modal.fastapi_endpoint(method="GET")
+def recent_jobs(limit: int = 10):
+    """GET /?limit=10 — returns the last N video_jobs rows, newest first."""
+    import os
+    from supabase import create_client
+    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    res = sb.table("video_jobs").select(
+        "id,status,settings,created_at,updated_at,render_time_ms,error_message,output_url"
+    ).order("created_at", desc=True).limit(int(limit)).execute()
+    return {"count": len(res.data or []), "jobs": res.data or []}
