@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_disable_cpu_offload'",
+        "echo 'cache_bust_testing_serialize'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -87,9 +87,9 @@ def download_weights():
     volumes={MODEL_DIR: model_volume},
     cpu=12,
     memory=65536,
-    scaledown_window=180,    # stay warm 3 min after last job
+    scaledown_window=600,    # TESTING MODE: stay warm 10 min (was 180s). Revert to 180 before launch.
     timeout=3600,            # 60 min max per render (step 50 + TeaCache off can push past 30 min)
-    max_containers=10,       # cap parallel renders (raise later if needed)
+    max_containers=1,        # TESTING MODE: serialize so render #2 queues on same warm container (was 10). Revert before launch.
     secrets=[supabase_secret],
 )
 class AvatarRenderer:
