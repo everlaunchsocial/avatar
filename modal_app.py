@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_testing_serialize'",
+        "echo 'cache_bust_phase_a_golden_restore'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -45,6 +45,13 @@ image = (
         # H100 has 80 GB; full model is ~33 GB; offload is unnecessary and
         # was the primary cause of our ~7x slowdown vs RunPod.
         "DISABLE_SP": "1",
+        # PyTorch allocator safety setting per forensic audit (Report 3 #1).
+        # `max_split_size_mb:256` keeps fragmentation from breaking VAE
+        # decode on long (30s+) renders. CRITICAL: do NOT add
+        # `expandable_segments:True` — that setting crashes Modal's
+        # CUDA allocator with INTERNAL ASSERT FAILED (killed the driver
+        # in prior Verda / Modal attempts, see commit history from yesterday).
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
 )

@@ -660,7 +660,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 scaled_distance = rescale_func(rel_distance.item())
                 self.teacache_accumulated_distance += scaled_distance
                 
-                if self.teacache_accumulated_distance < self.teacache_thresh:
+                # Fix 6: Early-Step Protection — NEVER skip during first 15%
+                # of steps so identity/lighting/eyes lock in before TeaCache
+                # begins skipping. Skipping a high-frequency refinement step
+                # early causes the whole denoise trajectory to lose detail,
+                # producing the "dull/flat/no-eye-sparkle" symptom reported
+                # when migrating to Modal. Restored per RunPod golden config.
+                # Source: forensic audit of prior chat-3 (Fix 6 Early-Step
+                # Protection) + chat-2 Golden Baseline Hardening.
+                if self.teacache_accumulated_distance < self.teacache_thresh \
+                        and self.teacache_cnt >= self.teacache_num_steps * 0.15:
                     should_calc = False
                     self.teacache_skipped_steps += 1
                 else:

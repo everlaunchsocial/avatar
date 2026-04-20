@@ -99,7 +99,34 @@ def load_engine():
     log("loading engine...")
     device = torch.device("cuda")
 
-    # Parse default args with our settings
+    # FA3 Hopper diagnostic — critical. The pre-built image ships
+    # flash_attn_interface + flashattn_hopper_cuda.so from the hopper/
+    # subdir at tag v2.7.4.post1. If that import fails, the code in
+    # models_audio.py line 11-13 silently falls back to FA2 which is
+    # 5-7x slower on H100. This print tells us at boot which path is
+    # actually live. Per forensic audit, this silent fallback was THE
+    # #1 cause of speed regression.
+    try:
+        import flash_attn_interface as _fa3
+        log(f"[FA3-DIAG] ✅ FA3 Hopper ACTIVE — loaded from {_fa3.__file__}")
+        try:
+            from flash_attn_interface import flash_attn_varlen_func as _fa3_func
+            log(f"[FA3-DIAG] ✅ flash_attn_varlen_func resolved from: {_fa3_func.__module__}")
+        except Exception as _e:
+            log(f"[FA3-DIAG] ⚠️ flash_attn_varlen_func import failed: {_e}")
+    except ImportError as _e:
+        log(f"[FA3-DIAG] ❌ FA3 NOT ACTIVE — falling back to FA2/SDPA. This is the #1 speed regression. Error: {_e}")
+        try:
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa2_func
+            log(f"[FA3-DIAG] ℹ️  FA2 fallback available from: {_fa2_func.__module__}")
+        except Exception as _e2:
+            log(f"[FA3-DIAG] ❌❌ FA2 also missing — attention will use torch SDPA (slowest). Error: {_e2}")
+
+    # Parse default args with our settings.
+    # NOTE: these are the ENGINE-LOAD defaults. Per-render user settings
+    # (cfg_scale, flow_shift, steps, etc.) override these later in render().
+    # Values below reflect the RunPod "Golden Baseline" config restored
+    # 2026-04-20 per forensic audit — NOT the prior Modal-dull config.
     sys.argv = [
         "worker",
         "--input", "dummy.csv",
@@ -109,12 +136,18 @@ def load_engine():
         "--image-size", "512",
         "--cfg-scale", "7.5",
         "--infer-steps", "50",
-        "--use-deepcache", "0",
+        # DeepCache ON — RunPod golden config had this enabled. Provides
+        # additional per-step caching of attention outputs. Previously 0.
+        "--use-deepcache", "1",
         # --cpu-offload removed: runs ~7x slower than non-offload path.
         # H100 has 80GB, full model is ~33GB — offload is unnecessary.
         "--flow-shift-eval-video", "5.0",
         "--save-path", str(WORKSPACE / "results"),
         "--use-fp8",
+        # VAE bf16 cast (RunPod golden config). Default is fp16 which
+        # compresses highlight/shadow range and was responsible for the
+        # "dull/darker eyes and background" symptom on Modal.
+        "--vae-precision", "bf16",
     ]
     args = parse_args()
 
@@ -183,10 +216,14 @@ def render(engine, image_path, audio_path, output_path, settings):
     align_instance = engine["align_instance"]
     feature_extractor = engine["feature_extractor"]
 
-    # Override args with job settings
-    args.infer_steps = int(settings.get("inference_steps", 50))
-    args.cfg_scale = float(settings.get("cfg_scale", 7.5))
-    args.flow_shift_eval_video = float(settings.get("flow_shift", 5.0))
+    # Override args with job settings. Defaults restored to RunPod
+    # Golden Baseline ("4-4-3-0.18" per forensic audit, chat-3:8598):
+    # Steps 4 / CFG 4 / Flow 3 / TeaCache 0.18 + Fix 6. This produced
+    # ~93s renders with sharp eyes at low step count. User can override
+    # via Lovable settings JSON per render.
+    args.infer_steps = int(settings.get("inference_steps", 5))
+    args.cfg_scale = float(settings.get("cfg_scale", 4.0))
+    args.flow_shift_eval_video = float(settings.get("flow_shift", 3.0))
     length = settings.get("video_length", "5s")
     args.sample_n_frames = FMAP.get(length, 129)
     seed_val = settings.get("seed")

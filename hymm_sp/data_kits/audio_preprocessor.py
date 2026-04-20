@@ -54,7 +54,7 @@ def encode_audio(wav2vec, audio_feats, fps, num_frames=129):
     elif fps == 12.5:
         start_ts = [0]
         step_ts = [2]
-    num_frames = min(num_frames, 750)  # 30s at 25fps  # support up to 80s
+    num_frames = min(num_frames, 2000)  # 80s at 25fps (per forensic audit: 400 was 16s cap, 750 was 30s, 2000 is full 80s)
     audio_feats = wav2vec.encoder(audio_feats.unsqueeze(0)[:, :, :3000], output_hidden_states=True).hidden_states
     audio_feats = torch.stack(audio_feats, dim=2)
     audio_feats = torch.cat([torch.zeros_like(audio_feats[:,:4]), audio_feats], 1)
