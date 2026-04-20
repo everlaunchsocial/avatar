@@ -279,8 +279,13 @@ def render(engine, image_path, audio_path, output_path, settings):
         #                     without blowing out already-bright pixels
         # Two filters chained.
         if settings.get("color_boost", True):
-            color_filter = "-vf eq=saturation=1.4:contrast=1.18:brightness=-0.03,vibrance=intensity=0.4"
-            log("color_boost ffmpeg grade applied (sat+40 / con+18 / bri-0.03 / vibrance+40)")
+            # Tuned down from sat=1.4 / vibrance=0.4 — that combo cast skin
+            # tones orange. Vibrance specifically over-boosts muted warm
+            # tones, which is exactly what faces ARE, so it compounded.
+            # New values: moderate saturation bump, gentle contrast, no
+            # vibrance. Should give "more pop than raw" without "orangey".
+            color_filter = "-vf eq=saturation=1.25:contrast=1.12:brightness=-0.02"
+            log("color_boost ffmpeg grade applied (sat+25 / con+12 / bri-0.02 / vibrance removed)")
         else:
             color_filter = ""
         os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' {color_filter} -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
