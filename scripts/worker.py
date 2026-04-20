@@ -361,11 +361,32 @@ def process_job(sb, engine, job):
 
         ie = iu.split("?")[0].rsplit(".", 1)[-1].lower()
         ie = "jpg" if ie not in ("jpg", "jpeg", "png") else ie
+        # Accept a wide range of audio/video-container formats. We always
+        # normalize to 16 kHz mono wav below (Whisper's native format), so
+        # the exact input extension only matters for the download filename.
         ae = au.split("?")[0].rsplit(".", 1)[-1].lower()
-        ae = "wav" if ae not in ("wav", "mp3") else ae
+        if ae not in ("wav", "mp3", "webm", "ogg", "m4a", "aac", "flac", "opus", "mp4", "mov", "mkv"):
+            ae = "bin"  # unknown — ffmpeg will sniff the container on decode
 
         ip = dl(iu, jt / f"input.{ie}")
-        ap = dl(au, jt / f"input.{ae}")
+        ap_raw = dl(au, jt / f"input_raw.{ae}")
+
+        # Universal audio normalization to 16 kHz mono wav. Whisper-tiny
+        # (used internally for audio embedding) requires this format, and
+        # normalizing up-front protects against every weird audio format
+        # a customer might upload: webm, m4a, opus, flac, even video
+        # containers like mp4/mov where ffmpeg extracts the audio track.
+        # If the source is already 16 kHz mono wav, this is a near-instant
+        # re-encode. If not, it converts. Either way the model gets a
+        # predictable input.
+        ap = jt / "input.wav"
+        t0 = time.time()
+        ret = os.system(f"ffmpeg -i '{ap_raw}' -ar 16000 -ac 1 -y '{ap}' -loglevel quiet")
+        if ret != 0 or not ap.exists() or ap.stat().st_size == 0:
+            log(f"audio normalization failed (ret={ret}), falling back to raw")
+            ap = ap_raw
+        else:
+            log(f"audio normalized to 16kHz mono wav in {time.time()-t0:.2f}s (from .{ae})")
 
         # Optional photo enhancement — CLAHE + sharpen + PNG re-save to
         # eliminate lighting drift from uneven illumination / JPEG noise.
