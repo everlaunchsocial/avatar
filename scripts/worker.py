@@ -41,37 +41,47 @@ def log(m):
 
 # ============================================================
 # PHOTO ENHANCEMENT (for "sunrise/sundowning" temporal lighting
-# drift). Normalizes local lighting via CLAHE + sharpens + re-saves
-# as lossless PNG so the diffusion model isn't fed JPEG noise or
-# uneven illumination gradients that it then amplifies per-frame.
+# drift). Proven fix from previous RunPod testing:
+#
+#   1. PIL.ImageOps.autocontrast()  — globally normalize exposure,
+#      so the model gets a consistent starting lighting distribution
+#      rather than interpreting extreme darks/lights as directional
+#      illumination to animate.
+#   2. PIL.ImageFilter.GaussianBlur(radius=1)  — very light blur to
+#      kill JPEG micro-noise and grain. The diffusion model was
+#      mistakenly animating those noise patterns as if they were
+#      real features, which produced the lighting oscillation.
+#   3. Save as lossless PNG — avoid re-introducing JPEG noise on
+#      the way back out.
+#
+# Earlier attempt used CLAHE + UnsharpMask. CLAHE fixed the
+# background drift but made faces look charcoal/over-defined
+# because it boosts LOCAL contrast (which maps onto skin as
+# exaggerated shadow outlines). Autocontrast is global, so it
+# lifts the whole histogram uniformly and leaves skin natural.
+#
 # Triggered per-job with settings.enhance=true (default off, so
 # existing photos are untouched unless the flag is set).
 # ============================================================
 def enhance_image(src_path: Path, dst_path: Path):
-    import cv2
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageOps, ImageFilter
 
     img = Image.open(str(src_path)).convert("RGB")
-    arr = np.array(img)
 
-    # CLAHE on the L channel in LAB colour space. This normalizes
-    # LOCAL contrast (per tile) rather than global — critical for
-    # photos with lighting gradients (one side bright, other dark)
-    # which otherwise drift across frames.
-    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    # 1. Normalize exposure globally — stretches the histogram so
+    #    darkest pixel becomes (near-)black and brightest becomes
+    #    (near-)white. `cutoff=1` ignores the top/bottom 1% of
+    #    pixels so a single hot highlight or shadow doesn't skew
+    #    the normalization.
+    img = ImageOps.autocontrast(img, cutoff=1)
 
-    # Light unsharp mask to restore detail lost to JPEG compression
-    # without introducing halos.
-    img = Image.fromarray(arr)
-    img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=30, threshold=3))
+    # 2. Light Gaussian blur to flatten micro-noise. Radius=1 is
+    #    ALMOST imperceptible to the eye but obliterates the
+    #    sub-pixel noise patterns that diffusion would otherwise
+    #    try to animate into frame-to-frame drift.
+    img = img.filter(ImageFilter.GaussianBlur(radius=1))
 
-    # Save lossless. PNG path avoids the per-frame chroma drift that
-    # JPEG compression can cause the model to interpret as lighting change.
+    # 3. Lossless PNG out.
     img.save(str(dst_path), "PNG", optimize=False)
     return dst_path
 
@@ -332,7 +342,7 @@ def process_job(sb, engine, job):
             enhanced = jt / "input_enhanced.png"
             t0 = time.time()
             enhance_image(ip, enhanced)
-            log(f"enhanced photo in {time.time()-t0:.1f}s (CLAHE + sharpen + PNG)")
+            log(f"enhanced photo in {time.time()-t0:.1f}s (autocontrast + blur(1) + PNG)")
             ip = enhanced
 
         output_file = jr / "output_audio.mp4"
