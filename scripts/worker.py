@@ -40,6 +40,43 @@ def log(m):
 
 
 # ============================================================
+# PHOTO ENHANCEMENT (for "sunrise/sundowning" temporal lighting
+# drift). Normalizes local lighting via CLAHE + sharpens + re-saves
+# as lossless PNG so the diffusion model isn't fed JPEG noise or
+# uneven illumination gradients that it then amplifies per-frame.
+# Triggered per-job with settings.enhance=true (default off, so
+# existing photos are untouched unless the flag is set).
+# ============================================================
+def enhance_image(src_path: Path, dst_path: Path):
+    import cv2
+    from PIL import Image, ImageFilter
+
+    img = Image.open(str(src_path)).convert("RGB")
+    arr = np.array(img)
+
+    # CLAHE on the L channel in LAB colour space. This normalizes
+    # LOCAL contrast (per tile) rather than global — critical for
+    # photos with lighting gradients (one side bright, other dark)
+    # which otherwise drift across frames.
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    # Light unsharp mask to restore detail lost to JPEG compression
+    # without introducing halos.
+    img = Image.fromarray(arr)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=30, threshold=3))
+
+    # Save lossless. PNG path avoids the per-frame chroma drift that
+    # JPEG compression can cause the model to interpret as lighting change.
+    img.save(str(dst_path), "PNG", optimize=False)
+    return dst_path
+
+
+# ============================================================
 # MODEL LOADING — happens ONCE at startup, stays in VRAM
 # ============================================================
 def load_engine():
@@ -273,8 +310,10 @@ def process_job(sb, engine, job):
     jr.mkdir(parents=True, exist_ok=True)
 
     try:
-        iu = job.get("image_url")
-        au = job.get("audio_url")
+        # Settings can override image_url/audio_url (for quick swap testing
+        # via the HTTP endpoint without needing to update Supabase storage).
+        iu = s.get("image_url") or job.get("image_url")
+        au = s.get("audio_url") or job.get("audio_url")
         if not iu or not au:
             raise RuntimeError("missing image_url or audio_url")
 
@@ -285,6 +324,16 @@ def process_job(sb, engine, job):
 
         ip = dl(iu, jt / f"input.{ie}")
         ap = dl(au, jt / f"input.{ae}")
+
+        # Optional photo enhancement — CLAHE + sharpen + PNG re-save to
+        # eliminate lighting drift from uneven illumination / JPEG noise.
+        # OFF by default so photos that already render well stay bit-identical.
+        if s.get("enhance"):
+            enhanced = jt / "input_enhanced.png"
+            t0 = time.time()
+            enhance_image(ip, enhanced)
+            log(f"enhanced photo in {time.time()-t0:.1f}s (CLAHE + sharpen + PNG)")
+            ip = enhanced
 
         output_file = jr / "output_audio.mp4"
         video_path, render_time = render(engine, ip, ap, output_file, s)
