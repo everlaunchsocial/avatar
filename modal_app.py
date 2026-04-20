@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_uncond_audio_shape'",
+        "echo 'cache_bust_settings_override'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -44,10 +44,6 @@ image = (
         # single-GPU code path that offloads LLaVA (~16GB) to CPU.
         "CPU_OFFLOAD": "1",
         "DISABLE_SP": "1",
-        # Debug: make CUDA errors synchronous so Python tracebacks line up
-        # with the actual failing kernel launch. Safe to leave on while
-        # stabilising; remove once we have a successful render.
-        "CUDA_LAUNCH_BLOCKING": "1",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")
 )
@@ -203,17 +199,38 @@ class AvatarRenderer:
         ensure_bucket(self.sb)
 
     @modal.method()
-    def render_job(self, job_id: str):
-        """Called by the Supabase Edge Function (or any HTTP trigger) with a job_id."""
+    def render_job(self, job_id: str, settings_override: dict = None):
+        """Called by the Supabase Edge Function (or any HTTP trigger) with a job_id.
+
+        settings_override (dict, optional): merged into the job's `settings`
+        dict before rendering. Lets the HTTP caller tune `inference_steps`,
+        `cfg_scale`, `video_length`, `teacache_threshold`, etc. per request
+        without having to update the Supabase row first. Useful for
+        iteration during stabilisation and quality tuning.
+        """
         # Fetch the job row from Supabase
         res = self.sb.table("video_jobs").select("*").eq("id", job_id).execute()
         if not res.data:
             return {"status": "error", "message": f"Job {job_id} not found"}
         job = res.data[0]
 
+        # Apply per-request setting overrides (if any).
+        if settings_override:
+            merged = dict(job.get("settings") or {})
+            merged.update(settings_override)
+            job["settings"] = merged
+            print(f"[render_job] settings override applied: {settings_override}")
+            print(f"[render_job] effective settings: {merged}")
+
         # Mark as processing (Supabase schema doesn't have this state by default,
         # but we add it here so the row moves out of "pending")
-        self.sb.table("video_jobs").update({"status": "processing"}).eq("id", job_id).execute()
+        # Also clear stale error_message / output_url from any previous run.
+        self.sb.table("video_jobs").update({
+            "status": "processing",
+            "error_message": None,
+            "output_url": None,
+            "render_time_ms": None,
+        }).eq("id", job_id).execute()
 
         # Reuse the exact process_job logic from scripts/worker.py
         from worker import process_job
@@ -234,8 +251,42 @@ class AvatarRenderer:
     timeout=1800,
 )
 @modal.fastapi_endpoint(method="POST")
-def render_endpoint(job_id: str):
-    """POST /?job_id=<uuid> — triggers a render. Returns the result."""
+def render_endpoint(
+    job_id: str,
+    inference_steps: int = None,
+    cfg_scale: float = None,
+    video_length: str = None,
+    flow_shift: float = None,
+    teacache_enabled: bool = None,
+    teacache_threshold: float = None,
+    seed: int = None,
+    prompt: str = None,
+):
+    """POST /?job_id=<uuid>[&inference_steps=30&cfg_scale=6.5&...]
+
+    Triggers a render for a Supabase video_jobs row. Any query-string
+    parameter that matches a known render setting is merged on top of
+    whatever is stored in the row, so quality/step tuning can happen
+    without editing Supabase between tests.
+    """
+    overrides = {}
+    if inference_steps is not None:
+        overrides["inference_steps"] = inference_steps
+    if cfg_scale is not None:
+        overrides["cfg_scale"] = cfg_scale
+    if video_length is not None:
+        overrides["video_length"] = video_length
+    if flow_shift is not None:
+        overrides["flow_shift"] = flow_shift
+    if teacache_enabled is not None:
+        overrides["teacache_enabled"] = teacache_enabled
+    if teacache_threshold is not None:
+        overrides["teacache_threshold"] = teacache_threshold
+    if seed is not None:
+        overrides["seed"] = seed
+    if prompt is not None:
+        overrides["prompt"] = prompt
+
     renderer = AvatarRenderer()
-    result = renderer.render_job.remote(job_id)
+    result = renderer.render_job.remote(job_id, overrides or None)
     return result
