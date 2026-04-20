@@ -218,7 +218,7 @@ def render(engine, image_path, audio_path, output_path, settings):
     # to nudge the diffusion model into producing more saturated, more
     # cinematically-graded output. Off by default so existing prompts
     # stay verbatim unless the operator opts in.
-    if settings.get("color_boost"):
+    if settings.get("color_boost", True):
         color_modifiers = " vibrant colors cinematic lighting high contrast professional color grading detailed skin textures rich saturation"
         prompt = f"{prompt}{color_modifiers}".strip()
         log(f"color_boost prompt modifiers appended")
@@ -278,7 +278,7 @@ def render(engine, image_path, audio_path, output_path, settings):
         #                     than already-vivid ones, so skin/shadows pop
         #                     without blowing out already-bright pixels
         # Two filters chained.
-        if settings.get("color_boost"):
+        if settings.get("color_boost", True):
             color_filter = "-vf eq=saturation=1.4:contrast=1.18:brightness=-0.03,vibrance=intensity=0.4"
             log("color_boost ffmpeg grade applied (sat+40 / con+18 / bri-0.03 / vibrance+40)")
         else:
