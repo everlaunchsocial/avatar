@@ -213,15 +213,15 @@ def render(engine, image_path, audio_path, output_path, settings):
     # Create temporary CSV for the dataset loader
     prompt = (settings.get("prompt") or "A person speaking naturally and confidently").replace(",", " ").strip()
 
-    # Color-boost prompt modifiers — when enabled, secretly append the
-    # "quality modifiers" that commercial platforms (Hedra, HeyGen) use
-    # to nudge the diffusion model into producing more saturated, more
-    # cinematically-graded output. Off by default so existing prompts
-    # stay verbatim unless the operator opts in.
-    if settings.get("color_boost", True):
-        color_modifiers = " vibrant colors cinematic lighting high contrast professional color grading detailed skin textures rich saturation"
-        prompt = f"{prompt}{color_modifiers}".strip()
-        log(f"color_boost prompt modifiers appended")
+    # NOTE: previously appended "vibrant colors / cinematic lighting /
+    # high contrast / detailed skin textures" quality modifiers to the
+    # prompt here. In testing this caused the model to OVER-amplify
+    # facial features — specifically lips/mouth "jumping out" even at
+    # low CFG (3.0). The model interpreted "detailed skin textures" +
+    # "high contrast" as a directive to exaggerate facial motion.
+    # Removed. color_boost now ONLY does the ffmpeg post-render grade,
+    # which is applied AFTER the model and cannot influence how faces
+    # are animated.
     csv_path = image_path.parent / "input.csv"
     csv_path.write_text(f"videoid,image,audio,prompt,fps\n1,{image_path},{audio_path},{prompt},25\n")
 

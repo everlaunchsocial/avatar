@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_color_dial_back'",
+        "echo 'cache_bust_remove_prompt_modifiers'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
