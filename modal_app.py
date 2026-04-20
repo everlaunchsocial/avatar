@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_generator_device_fix'",
+        "echo 'cache_bust_transformer_to_cuda'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -145,22 +145,30 @@ class AvatarRenderer:
             raise
         print(f"✅ Engine loaded in {time.time() - start:.1f}s")
 
-        # ─── MANUAL VRAM RECOVERY ─────────────────────────────────
-        # Even with CPU_OFFLOAD=1, modules are loaded on GPU first then
-        # "should" be moved. Force them to CPU now.
+        # ─── DEVICE PLACEMENT FIX ─────────────────────────────────
+        # CPU_OFFLOAD=1 causes hymm_sp.modules.models_audio to initialize the
+        # 13B transformer on CPU. The pipeline has runtime .to('cuda') logic
+        # for text_encoder and vae, but NOT for the transformer — so when
+        # pipeline.transformer(...) is called, its weights are on CPU while
+        # input tensors (motion_exp, latents, etc.) are on CUDA. This throws:
+        #   "argument mat1 in method wrapper_CUDA_addmm"
+        # Fix: force the transformer onto CUDA here. We have 79 GiB free and
+        # the transformer is ~13 GB FP8, so this is comfortable.
         import gc
         sampler = self.engine["sampler"]
 
-        # Evict text encoders (LLaVA ~16GB, CLIP ~1GB) to CPU — they only
-        # run at the start of each job, not during the main diffusion.
-        for attr in ("text_encoder", "text_encoder_2"):
-            enc = getattr(sampler, attr, None)
-            if enc is not None and hasattr(enc, "to"):
-                try:
-                    enc.to("cpu")
-                    print(f"Evicted {attr} to CPU")
-                except Exception as e:
-                    print(f"Could not evict {attr}: {e}")
+        transformer = getattr(sampler, "model", None)
+        if transformer is not None and hasattr(transformer, "to"):
+            try:
+                transformer.to("cuda")
+                print("Moved transformer (sampler.model) to CUDA")
+            except Exception as e:
+                print(f"Could not move transformer to CUDA: {e}")
+
+        # Leave text_encoder / text_encoder_2 where load_engine() left them —
+        # the pipeline already has cpu_offload logic that moves them to CUDA
+        # for prompt encoding and back to CPU afterwards (see logs:
+        # "encode prompt: move text_encoder to cuda / ... to cpu").
 
         # Enable VAE tiling+slicing so decode doesn't OOM at the end.
         # VAE tile sizes are already overridden in worker.load_engine().
