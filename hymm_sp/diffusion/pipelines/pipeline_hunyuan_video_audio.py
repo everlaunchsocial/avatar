@@ -1106,6 +1106,17 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
         shift = 0
         shift_offset = 10
         frames_per_batch = 33
+        # Phase D: window overlap for smoother boundary transitions.
+        # Stride = frames_per_batch - overlap. Positions in the overlap
+        # zone receive TWO noise predictions (one from each adjacent
+        # window) which the existing counter-based averaging mechanism
+        # (see pred_latents /= counter below) smooths automatically.
+        # Kills the ~5-sec "scoop" / "head dip" artifact reported at
+        # latent-frame 32/33 window boundary. Cost: ~25% more compute
+        # per step (4 windows per step vs 3 for 15s video). No new
+        # settings exposed — always on. Set overlap=0 to revert.
+        window_overlap = 8
+        window_stride = max(1, frames_per_batch - window_overlap)
         self.cache_tensor = None
 
         """ If the total length is shorter than 129, shift is not required """
@@ -1131,7 +1142,11 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                     dtype=latents_all.dtype,
                 ).to(device=latents_all.device)
 
-                for index_start in range(0, infer_length, frames_per_batch):
+                # Use window_stride (= frames_per_batch - overlap) so
+                # adjacent windows share overlap frames, which the counter
+                # mechanism below then blends. Boundary artifact at
+                # ~5-sec (latent frame 32/33) is hidden by this averaging.
+                for index_start in range(0, infer_length, window_stride):
                     self.scheduler._step_index = None
 
                     index_start = index_start - shift
