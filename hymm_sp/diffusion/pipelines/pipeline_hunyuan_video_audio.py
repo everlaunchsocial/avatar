@@ -971,6 +971,17 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
 
         device = self._execution_device
 
+        # When cpu_offload is enabled, the diffusers base class reports
+        # _execution_device as CPU, but the transformer itself actually lives
+        # on CUDA (moved there explicitly in modal_app.py @modal.enter()).
+        # Timesteps, latents, and additional_kwargs must be created on CUDA so
+        # they match the transformer's weights — otherwise self.time_in(t),
+        # self.motion_exp(...), etc. hit:
+        #   RuntimeError: argument mat1 in method wrapper_CUDA_addmm
+        # Force device=cuda when cpu_offload is on.
+        if cpu_offload and torch.cuda.is_available():
+            device = torch.device("cuda")
+
         # 3. Encode input prompt
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
