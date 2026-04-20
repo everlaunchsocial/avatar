@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_add_poller'",
+        "echo 'cache_bust_fix_sweep_races_claim'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -223,13 +223,17 @@ class AvatarRenderer:
             print(f"[render_job] effective settings: {merged}")
 
         # Mark as processing (Supabase schema doesn't have this state by default,
-        # but we add it here so the row moves out of "pending")
+        # but we add it here so the row moves out of "pending").
         # Also clear stale error_message / output_url from any previous run.
+        # Bump updated_at so the poller's stale-sweep doesn't kill this
+        # mid-render (renders can take 5-10+ min; sweep threshold is 30 min).
+        from datetime import datetime, timezone
         self.sb.table("video_jobs").update({
             "status": "processing",
             "error_message": None,
             "output_url": None,
             "render_time_ms": None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", job_id).execute()
 
         # Reuse the exact process_job logic from scripts/worker.py
@@ -290,13 +294,21 @@ def poll_pending_jobs():
     if not pending:
         return {"pending": 0, "fired": 0}
 
+    now_iso = datetime.now(timezone.utc).isoformat()
     renderer = AvatarRenderer()
     fired = 0
     for row in pending:
         jid = row["id"]
         # Atomic claim: flip to processing only if still pending, to prevent
         # a second poll (or another worker) from double-firing the same row.
-        claim = sb.table("video_jobs").update({"status": "processing"}).eq("id", jid).eq("status", "pending").execute()
+        # CRITICAL: bump updated_at to NOW so the stale-sweep on the next
+        # poll iteration doesn't think this row is timed-out (its original
+        # updated_at is from when Lovable first inserted the row, which
+        # is already older than the stale threshold for long-pending rows).
+        claim = sb.table("video_jobs").update({
+            "status": "processing",
+            "updated_at": now_iso,
+        }).eq("id", jid).eq("status", "pending").execute()
         if not claim.data:
             print(f"[poll] skipped {jid} (already claimed)")
             continue
