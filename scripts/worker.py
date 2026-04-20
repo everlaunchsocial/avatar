@@ -595,8 +595,24 @@ def process_job(sb, engine, job):
         # Format: {jid}/v-{UTC_ISO_timestamp}-{qp_mode}.mp4
         # Also write a {jid}.mp4 "latest" alias pointing at this version so
         # any Lovable UI that assumes the flat filename keeps working.
+        #
+        # Compute the qp_mode tag here (in process_job scope) since it was
+        # originally parsed inside render()'s local scope — mirror the same
+        # normalization logic so filenames reflect the effective mode used.
+        _qp_raw = s.get("quality_pass", "off")
+        if isinstance(_qp_raw, bool):
+            _qp_tag = "full" if _qp_raw else "off"
+        else:
+            _qp_s = str(_qp_raw).strip().lower()
+            if _qp_s in ("off", "false", "none", "0", ""):
+                _qp_tag = "off"
+            elif _qp_s in ("face", "face_only"):
+                _qp_tag = "face"
+            elif _qp_s in ("full", "true", "1"):
+                _qp_tag = "full"
+            else:
+                _qp_tag = "off"
         _ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        _qp_tag = _qp_mode if _qp_mode in ("face", "full") else "noqp"
         versioned_sp = f"{jid}/v-{_ts}-qp_{_qp_tag}.mp4"
         latest_sp = f"{jid}.mp4"
         fb = video_path.read_bytes()
