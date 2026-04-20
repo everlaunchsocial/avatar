@@ -689,7 +689,17 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # With cpu_offload enabled, self._execution_device resolves to CPU
+            # but `generator` was created on CUDA in sample_inference_audio.predict().
+            # randn_tensor rejects mismatched devices — so create the noise on the
+            # generator's device and then move it to the target device.
+            _gen = generator[0] if isinstance(generator, list) and generator else generator
+            _gen_device = getattr(_gen, "device", None)
+            _target_device = torch.device(device) if device is not None else None
+            if _gen_device is not None and _target_device is not None and _gen_device.type != _target_device.type:
+                latents = randn_tensor(shape, generator=generator, device=_gen_device, dtype=dtype).to(_target_device)
+            else:
+                latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         else:
             latents = latents.to(device)
 
