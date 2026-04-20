@@ -112,7 +112,16 @@ class HunyuanVideoSampler(Inference):
         # wav2vec.to("cpu")
         torch.cuda.empty_cache()
 
-        uncond_audio_prompts = torch.zeros_like(audio_prompts[:,:video_frame_count])
+        # uncond_audio_prompts MUST have the same shape[1] as audio_prompts.
+        # The pipeline's denoising loop (pipeline_hunyuan_video_audio.py:1100-1103)
+        # pads audio_prompts_all and uncond_audio_prompts_all independently based
+        # on each tensor's length. When audio is longer than video_frame_count
+        # (e.g. 376 vs 129), that produces two _all tensors of different sizes
+        # (388 vs 260), and the shared `idx_list_audio` indices then fall out of
+        # bounds on uncond_audio_prompts_all -> CUDA IndexKernel assert.
+        # Zero-fill uncond to the same length as audio_prompts to keep them
+        # aligned all the way through.
+        uncond_audio_prompts = torch.zeros_like(audio_prompts)
         motion_exp = batch["motion_bucket_id_exps"].to(self.device)
         motion_pose = batch["motion_bucket_id_heads"].to(self.device)
         
