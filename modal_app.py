@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_upscale_sharpen'",
+        "echo 'cache_bust_timeout_60min'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -87,7 +87,7 @@ def download_weights():
     cpu=12,
     memory=65536,
     scaledown_window=180,    # stay warm 3 min after last job
-    timeout=1800,            # 30 min max per render
+    timeout=3600,            # 60 min max per render (step 50 + TeaCache off can push past 30 min)
     max_containers=10,       # cap parallel renders (raise later if needed)
     secrets=[supabase_secret],
 )
@@ -331,7 +331,7 @@ def poll_pending_jobs():
 @app.function(
     image=image,
     secrets=[supabase_secret],
-    timeout=1800,
+    timeout=3600,
 )
 @modal.fastapi_endpoint(method="POST")
 def render_endpoint(
