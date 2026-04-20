@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_timeout_60min'",
+        "echo 'cache_bust_disable_cpu_offload'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -39,10 +39,11 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "MASTER_ADDR": "localhost",
         "MASTER_PORT": "29500",
-        # CRITICAL: Hunyuan's text_encoder/vae/models read these from ENV VARS
-        # at import time. Both are needed to trigger the "very low VRAM"
-        # single-GPU code path that offloads LLaVA (~16GB) to CPU.
-        "CPU_OFFLOAD": "1",
+        # CPU_OFFLOAD removed 2026-04-20: RunPod ran this model WITHOUT
+        # offload at ~7 sec/step on H100. With offload on, we were hitting
+        # ~50 sec/step because of constant .to(cpu)/.to(cuda) shuffling.
+        # H100 has 80 GB; full model is ~33 GB; offload is unnecessary and
+        # was the primary cause of our ~7x slowdown vs RunPod.
         "DISABLE_SP": "1",
     })
     .workdir("/workspace/HunyuanVideo-Avatar")

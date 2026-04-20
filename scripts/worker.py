@@ -110,7 +110,8 @@ def load_engine():
         "--cfg-scale", "7.5",
         "--infer-steps", "50",
         "--use-deepcache", "0",
-        "--cpu-offload",
+        # --cpu-offload removed: runs ~7x slower than non-offload path.
+        # H100 has 80GB, full model is ~33GB — offload is unnecessary.
         "--flow-shift-eval-video", "5.0",
         "--save-path", str(WORKSPACE / "results"),
         "--use-fp8",
