@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_vae_tile_128'",
+        "echo 'cache_bust_supabase_unpin'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -87,7 +87,10 @@ supabase_secret = modal.Secret.from_name("supabase-keys")
 stitch_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
-    .pip_install(["supabase==2.3.0", "requests", "fastapi[standard]"])
+    # supabase unpinned so pip picks a current non-buggy version.
+    # 2.3.0 had a `proxy` kwarg regression that crashes Client.__init__.
+    # Unpinned gets whatever is current (typically 2.7+ which is fixed).
+    .pip_install(["supabase", "requests", "fastapi[standard]"])
 )
 
 
