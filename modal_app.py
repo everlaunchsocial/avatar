@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_revert_vae_tile'",
+        "echo 'cache_bust_stitch_source_url'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -612,26 +612,34 @@ def stitch_endpoint(payload: dict):
     total_duration = 0.0
 
     try:
-        # 1. For each segment: fetch row, download source MP4, trim with ffmpeg.
+        # 1. For each segment: fetch source URL (from job_id OR direct
+        # source_url), download, trim with ffmpeg. source_url lets callers
+        # reference specific VERSIONED files (e.g. /v-<timestamp>-qp_face.mp4)
+        # that aren't the current row's output_url. Useful for A/B tests
+        # and for regression-testing stitch quality (split + stitch a
+        # single video back together).
         for idx, seg in enumerate(segments):
-            jid = seg.get("job_id")
-            if not jid:
-                return {"status": "error", "error": f"segment {idx} missing job_id"}
+            src_url = seg.get("source_url")
             start_s = float(seg.get("start", 0))
             end_s = seg.get("end")
             if end_s is not None:
                 end_s = float(end_s)
 
-            # Lookup source URL from video_jobs
-            res = sb.table("video_jobs").select("output_url,status").eq("id", jid).execute()
-            if not res.data:
-                return {"status": "error", "error": f"job {jid} not found"}
-            row = res.data[0]
-            if row.get("status") != "done":
-                return {"status": "error", "error": f"job {jid} status is {row.get('status')} (need done)"}
-            src_url = row.get("output_url")
             if not src_url:
-                return {"status": "error", "error": f"job {jid} has no output_url"}
+                # Fall back to job_id lookup
+                jid = seg.get("job_id")
+                if not jid:
+                    return {"status": "error", "error": f"segment {idx} requires job_id or source_url"}
+                res = sb.table("video_jobs").select("output_url,status").eq("id", jid).execute()
+                if not res.data:
+                    return {"status": "error", "error": f"job {jid} not found"}
+                row = res.data[0]
+                # Allow any job that has a reachable output_url, even if the
+                # row's status got flipped to failed by a later render.
+                src_url = row.get("output_url")
+                if not src_url:
+                    return {"status": "error",
+                            "error": f"job {jid} has no output_url (status={row.get('status')})"}
 
             # Download source
             src_file = os.path.join(tmp_dir, f"src-{idx:02d}.mp4")
