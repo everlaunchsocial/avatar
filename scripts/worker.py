@@ -477,7 +477,25 @@ def render(engine, image_path, audio_path, output_path, settings):
             log("color_boost: 2x upscale + multi-scale sharpen + shadow-lift + warmth (webcam light)")
         else:
             color_filter = ""
-        os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' {color_filter} -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
+        # Strict MP4 compatibility flags so downloaded files play in
+        # VLC / Windows Media Player / QuickTime / Preview / phones.
+        # Previously the output had no explicit codec/pixfmt, which caused
+        # external players to refuse playback even though Lovable's
+        # browser-based player (lenient HTML5) worked fine.
+        #   -c:v libx264 -profile:v main      → universally supported H.264
+        #   -pix_fmt yuv420p                  → standard 8-bit YUV (no 10-bit, 4:2:0)
+        #   -c:a aac -b:a 192k                → standard AAC audio
+        #   -movflags +faststart              → moov atom at front (streamable)
+        # Without these, imageio's mp4 write defaults varied and could
+        # produce non-compliant streams.
+        _mux_opts = (
+            "-c:v libx264 -profile:v main -pix_fmt yuv420p "
+            "-c:a aac -b:a 192k -movflags +faststart"
+        )
+        os.system(
+            f"ffmpeg -y -loglevel quiet -i '{temp_video}' -i '{audio_path_str}' "
+            f"{color_filter} {_mux_opts} -shortest '{output_path}'; rm '{temp_video}'"
+        )
 
         return output_path, render_time
 
