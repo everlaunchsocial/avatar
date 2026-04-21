@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_stitch_concat_filter'",
+        "echo 'cache_bust_stitch_no_audio_fade'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -671,10 +671,12 @@ def stitch_endpoint(payload: dict):
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k",
-                # 5ms audio fade-in/out at each trim edge to prevent audio
-                # clicks at concat boundaries. Imperceptible to ear, kills
-                # brain's "something happened" attention trigger at cuts.
-                "-af", f"afade=t=in:d=0.005,afade=t=out:st={max(0,(duration_s or 10)-0.005):.3f}:d=0.005",
+                # No per-segment audio fade. Earlier attempt used 5ms
+                # fade-out + 5ms fade-in at each edge, but that created
+                # 10ms of near-silence at concat boundaries — heard as
+                # an audible duck/break in the middle of speech. The
+                # concat FILTER re-encodes audio samples in one pass
+                # which smooths any sample-level discontinuity naturally.
                 "-movflags", "+faststart",
                 trimmed_file,
             ]
