@@ -257,18 +257,16 @@ def load_engine():
     log("TeaCache enabled: thresh=0.18")
 
     # VAE tile override for H100 80GB.
-    # Temporal tile bumped 64 → 128 (audit Backlog #11) — reduces subtle
-    # "breathing" / pulsing seams on long (15s+) clips by decoding larger
-    # temporal chunks in single pass. Spatial stays at 256 (conservative
-    # for very high resolution), overlap up to 0.5 for cleaner blending
-    # between VAE tile boundaries.
+    # REVERTED 2026-04-21: temporal=128 + overlap=0.5 caused 108 GB OOM
+    # on 15s renders (tried to decode too many frames per tile). Back to
+    # the known-safe 64/16/0.25 values that worked tonight.
     vae = sampler.vae if hasattr(sampler, "vae") else sampler.pipeline.vae
     vae.tile_sample_min_size = 256
     vae.tile_latent_min_size = 32
-    vae.tile_sample_min_tsize = 128    # was 64 — reduces "breathing" on long clips
-    vae.tile_latent_min_tsize = 32     # was 16 — matches the 128 above (4x VAE compression)
-    vae.tile_overlap_factor = 0.5      # was 0.25 — smoother inter-tile blending
-    log("VAE tile override: spatial=256, temporal=128, overlap=0.5")
+    vae.tile_sample_min_tsize = 64
+    vae.tile_latent_min_tsize = 16
+    vae.tile_overlap_factor = 0.25
+    log("VAE tile override: spatial=256, temporal=64, overlap=0.25")
 
     # Load audio model (whisper)
     log("loading wav2vec...")
