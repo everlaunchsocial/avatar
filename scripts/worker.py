@@ -448,26 +448,30 @@ def render(engine, image_path, audio_path, output_path, settings):
         if settings.get("color_boost", True):
             # Post-render quality pass — stacked ffmpeg filter chain:
             #   1. 2x Lanczos upscale (cleaner edges, no AI required)
-            #   2. Unsharp mask wide-radius (broad edge detail — per audit
-            #      this alone gets ~30% of the way to Hedra)
-            #   3. Unsharp mask narrow-radius (fine texture — "Laplacian-
-            #      style" multi-scale sharpening per AI #1 recommendation +
-            #      audit backlog item #3 "Laplacian sharpening on final
-            #      frames — Fixes logo/shirt floating; cheap, deterministic")
-            #   4. Film-style tone curve — lifts shadows gently, rolloff
-            #      highlights to prevent clipping, gives "Hedra-pop" without
-            #      the flat linear contrast of pure eq filter (audit #2 LUT)
-            #   5. Color grade (saturation + contrast) for final punch
+            #   2. Unsharp mask wide-radius (broad edge detail)
+            #   3. Unsharp mask narrow-radius (fine texture)
+            #   4. SHADOW-LIFT curve — raises shadows so face isn't crushed
+            #      to black; Hedra/HeyGen fake "webcam ring light" this way.
+            #      Previous S-curve CRUSHED shadows (0/0 → 0.25/0.22 = darker).
+            #      New curve lifts (0/0.03 → 0.25/0.30 = brighter).
+            #   5. Color grade — slight positive brightness + gamma lift
+            #      + gentler contrast. Was causing "overly dark, no studio
+            #      light" feel per user tests 2026-04-21.
+            #   6. Slight warmth — colortemperature pulls mid-blues toward
+            #      slightly-warm, mimicking indoor tungsten/webcam light
+            #      temperature rather than flat daylight balance.
             color_filter = (
                 "-vf scale=iw*2:ih*2:flags=lanczos,"
-                "unsharp=7:7:0.8:5:5:0.4,"         # wide sharpen — edges
-                "unsharp=3:3:0.4:3:3:0.2,"         # narrow sharpen — fine detail
-                "curves=r='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1':"
-                "g='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1':"
-                "b='0/0 0.25/0.22 0.5/0.5 0.75/0.78 1/1',"  # subtle S-curve
-                "eq=saturation=1.25:contrast=1.12:brightness=-0.02"
+                "unsharp=7:7:0.8:5:5:0.4,"
+                "unsharp=3:3:0.4:3:3:0.2,"
+                # Shadow-lift curve (applied to all RGB equally for neutrality)
+                "curves=master='0/0.03 0.25/0.30 0.5/0.55 0.75/0.82 1/1.0',"
+                # Positive brightness + gamma lift + gentler contrast
+                "eq=saturation=1.2:contrast=1.05:brightness=0.02:gamma=1.05,"
+                # Warmth — 5500K is neutral daylight; 4800K adds subtle warmth
+                "colortemperature=temperature=4800:mix=0.5"
             )
-            log("color_boost applied: 2x upscale + multi-scale sharpen + film curve + sat+25/con+12")
+            log("color_boost: 2x upscale + multi-scale sharpen + shadow-lift + warmth (webcam light)")
         else:
             color_filter = ""
         os.system(f"ffmpeg -i '{temp_video}' -i '{audio_path_str}' {color_filter} -shortest '{output_path}' -y -loglevel quiet; rm '{temp_video}'")
