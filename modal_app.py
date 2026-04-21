@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_stitch_no_audio_fade'",
+        "echo 'cache_bust_production_config'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -190,9 +190,9 @@ def download_quality_weights():
     volumes={MODEL_DIR: model_volume},
     cpu=12,
     memory=65536,
-    scaledown_window=600,    # TESTING MODE: stay warm 10 min (was 180s). Revert to 180 before launch.
+    scaledown_window=180,    # PRODUCTION: 3 min warm between jobs (standard)
     timeout=3600,            # 60 min max per render (step 50 + TeaCache off can push past 30 min)
-    max_containers=1,        # TESTING MODE: serialize so render #2 queues on same warm container (was 10). Revert before launch.
+    max_containers=10,       # PRODUCTION: up to 10 concurrent H100s for parallel affiliate renders
     secrets=[supabase_secret],
 )
 class AvatarRenderer:
