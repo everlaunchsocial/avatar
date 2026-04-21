@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_revert_overlap_8'",
+        "echo 'cache_bust_stitch_concat_filter'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -652,16 +652,18 @@ def stitch_endpoint(payload: dict):
             # libx264 preset=veryfast is a good balance for CPU-only render:
             # ~realtime for 1080p on 2 vCPU. Audio to AAC 192k.
             trimmed_file = os.path.join(tmp_dir, f"trim-{idx:02d}.mp4")
-            # Use -t (duration) instead of -to (timestamp-with-ambiguous-
-            # reference-point). -t after -i is unambiguously "output this
-            # many seconds" regardless of -ss positioning. Previous code
-            # used -to which produced incorrect segment lengths (seam
-            # appeared in wrong place). Fixed 2026-04-21.
+            # Accurate seek: -ss AFTER -i forces frame-precise cuts (ffmpeg
+            # decodes from file start to the seek point). Slower (+1-2 sec
+            # for 15s source) but eliminates the ~1-3 frame discontinuity
+            # at segment boundaries that "fast seek" (-ss before -i) can
+            # cause. USER REPORTED: D-ID clean source → my stitch → jump
+            # appeared at cut. The cause was likely fast-seek keyframe
+            # rounding. This switch fixes it.
             duration_s = None if end_s is None else max(0.0, end_s - start_s)
             trim_args = [
                 "ffmpeg", "-y", "-loglevel", "error",
-                "-ss", f"{start_s:.3f}",
                 "-i", src_file,
+                "-ss", f"{start_s:.3f}",  # NOW after -i (accurate seek)
             ]
             if duration_s is not None:
                 trim_args += ["-t", f"{duration_s:.3f}"]
@@ -669,6 +671,10 @@ def stitch_endpoint(payload: dict):
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k",
+                # 5ms audio fade-in/out at each trim edge to prevent audio
+                # clicks at concat boundaries. Imperceptible to ear, kills
+                # brain's "something happened" attention trigger at cuts.
+                "-af", f"afade=t=in:d=0.005,afade=t=out:st={max(0,(duration_s or 10)-0.005):.3f}:d=0.005",
                 "-movflags", "+faststart",
                 trimmed_file,
             ]
@@ -678,19 +684,26 @@ def stitch_endpoint(payload: dict):
             if end_s is not None:
                 total_duration += (end_s - start_s)
 
-        # 2. Concat demuxer — safe and lossless since all trimmed files share codec.
-        concat_list = os.path.join(tmp_dir, "concat.txt")
-        with open(concat_list, "w", encoding="utf-8") as f:
-            for fp in trimmed_files:
-                # ffmpeg concat demuxer requires file paths in `file '...'` form.
-                f.write(f"file '{fp}'\n")
-
+        # 2. Concat FILTER (not demuxer). Demuxer was causing visible cut
+        # artifacts on clean sources (user reported D-ID source → stitch
+        # → jump at cut). Demuxer concats at packet level and can produce
+        # timestamp/SPS discontinuities between segments even when they
+        # share codec. Filter-based concat decodes everything and re-
+        # encodes as one unified stream — zero boundary state between
+        # segments. Cost: +5-10 sec of encoding time for a 15s output.
         output_file = os.path.join(tmp_dir, "stitched.mp4")
-        concat_args = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c", "copy",
+        concat_args = ["ffmpeg", "-y", "-loglevel", "error"]
+        for fp in trimmed_files:
+            concat_args += ["-i", fp]
+        concat_args += [
+            "-filter_complex",
+            f"concat=n={len(trimmed_files)}:v=1:a=1[v][a]",
+            "-map", "[v]",
+            "-map", "[a]",
+            "-c:v", "libx264", "-profile:v", "main",
+            "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             output_file,
         ]
