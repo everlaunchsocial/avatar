@@ -1106,17 +1106,38 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
         shift = 0
         shift_offset = 10
         frames_per_batch = 33
-        # Phase D: window overlap for smoother boundary transitions.
+        # Phase D: window overlap + cosine-weighted blend (Hann window).
+        #
         # Stride = frames_per_batch - overlap. Positions in the overlap
-        # zone receive TWO noise predictions (one from each adjacent
-        # window) which the existing counter-based averaging mechanism
-        # (see pred_latents /= counter below) smooths automatically.
-        # Kills the ~5-sec "scoop" / "head dip" artifact reported at
-        # latent-frame 32/33 window boundary. Cost: ~25% more compute
-        # per step (4 windows per step vs 3 for 15s video). No new
-        # settings exposed — always on. Set overlap=0 to revert.
+        # zone receive two contributions — one from each adjacent window.
+        #
+        # Rather than equal weighting (which blends near-edge frames of
+        # both windows = average of two UNSTABLE parts), we weight each
+        # frame by its distance from the window CENTER using cosine².
+        # Center frames contribute 1.0, edge frames contribute ~0.
+        # This means the overlap zone smoothly crossfades between
+        # "mostly window N" and "mostly window N+1" without either's
+        # unstable edge dominating. Kills the residual seams at 5/10/13s
+        # that remained after simple-average overlap (Phase D v1).
+        #
+        # Cost: zero. Just changes the weight used when accumulating.
         window_overlap = 8
         window_stride = max(1, frames_per_batch - window_overlap)
+
+        # Precompute Hann (cosine²) window weights for blending.
+        import math as _math
+        _center_idx = (frames_per_batch - 1) / 2.0
+        _window_weights = torch.tensor(
+            [
+                _math.cos(((_i - _center_idx) / _center_idx) * _math.pi / 2.0) ** 2
+                for _i in range(frames_per_batch)
+            ],
+            dtype=torch.float32,
+        )
+        # Clamp minimum so edge frames still get SOME contribution
+        # (prevents divide-by-zero if a position only gets edge hits).
+        _window_weights = torch.clamp(_window_weights, min=0.02)
+
         self.cache_tensor = None
 
         """ If the total length is shorter than 129, shift is not required """
@@ -1328,15 +1349,23 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                             "negative_prompt_embeds", negative_prompt_embeds
                         )
                     latents = latents.to(torch.bfloat16)
+                    # Hann-weighted accumulation — center frames contribute
+                    # the most, edge frames contribute the least. Produces
+                    # a smooth crossfade in the overlap zone between windows.
+                    # Without this (equal weighting), overlap zones blended
+                    # the LEAST-STABLE (edge) outputs of both windows =
+                    # residual seams at window boundaries (5s, 10s, 13s).
+                    _ww_device = _window_weights.to(device=pred_latents.device, dtype=pred_latents.dtype)
                     for iii in range(frames_per_batch):
                         p = (index_start + iii) % pred_latents.shape[2]
-                        pred_latents[:, :, p] += latents[:, :, iii]
-                        counter[:, :, p] += 1
+                        w = _ww_device[iii]
+                        pred_latents[:, :, p] += latents[:, :, iii] * w
+                        counter[:, :, p] += w
 
                 shift += shift_offset
-                shift = shift % frames_per_batch  
-                pred_latents  = pred_latents / counter
-                latents_all = pred_latents     
+                shift = shift % frames_per_batch
+                pred_latents  = pred_latents / counter.clamp(min=1e-6)
+                latents_all = pred_latents
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
