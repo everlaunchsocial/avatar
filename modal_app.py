@@ -87,7 +87,7 @@ supabase_secret = modal.Secret.from_name("supabase-keys")
 stitch_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
-    .pip_install(["supabase==2.3.0", "requests"])
+    .pip_install(["supabase==2.3.0", "requests", "fastapi[standard]"])
 )
 
 
