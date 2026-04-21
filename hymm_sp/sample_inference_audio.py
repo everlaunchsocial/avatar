@@ -133,16 +133,15 @@ class HunyuanVideoSampler(Inference):
         if _wav2vec_gain != 1.0:
             audio_prompts = audio_prompts * _wav2vec_gain
 
-        # Phase 1d: audio feature fade-in at clip start.
-        # Scripts with dense openings ("Hey it's Mike") drive the motion model
-        # hard in the first frames because the model has no prior context to
-        # damp with — it starts cold and the audio immediately demands motion.
-        # This fade ramps audio_prompts from 0.3x → 1.0x over the first 12
-        # frames (≈0.5s at the 25-fps feature cadence), giving the model a
-        # soft ramp-up from rest to full motion. Targets only the beginning;
-        # the rest of the clip sees unmodified features.
-        _fade_in_frames = int(getattr(args, "audio_fade_in_frames", 12))
-        _fade_in_start = float(getattr(args, "audio_fade_in_start", 0.3))
+        # Phase 1e: aggressive audio feature fade-in at clip start.
+        # User-reported "cocaine-head" lasts ~3 seconds on dense-opening scripts.
+        # Phase 1d (0.5s fade, 0.3 start) had zero visible impact — too short
+        # and too high a floor. Bumping to 3s fade starting from 0.05
+        # (near-silence) to give the model a long glide from rest to full
+        # motion. If 3s silence at start feels awkward on calm scripts, cut
+        # the fade window or raise the start value.
+        _fade_in_frames = int(getattr(args, "audio_fade_in_frames", 75))
+        _fade_in_start = float(getattr(args, "audio_fade_in_start", 0.05))
         if _fade_in_frames > 0 and audio_prompts.shape[1] > _fade_in_frames:
             fade = torch.linspace(_fade_in_start, 1.0, _fade_in_frames,
                                    device=audio_prompts.device,
