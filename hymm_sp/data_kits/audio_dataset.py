@@ -128,15 +128,15 @@ class VideoAudioTextLoaderVal(Dataset):
         audio_input, audio_len = get_audio_feature(self.feature_extractor, audio_path)
         audio_prompts = audio_input[0]
         
-        # Phase 1c smoothing: lower motion bucket head-pose ID 25 → 20 → 15.
-        # Earlier drop to 20 + LUFS killed the 5-sec RoPE-boundary stitch but
-        # left a "cocaine-head" rushed opening on scripts with dense audio
-        # openings (Hey-it's-Mike style). Dropping to 15 further damps global
-        # head-sway amplitude across all scripts. Tradeoff: calm scripts may
-        # look slightly under-motioned; if so, revert to 20 or introduce
-        # script-aware scaling. motion_bucket_id_exps stays at 30 to preserve
-        # expression amplitude for lip-sync accuracy.
-        motion_bucket_id_heads = np.array([15] * 4)
+        # Production value after iterations 2026-04-21:
+        #   25 (original) → 20 (Phase 1a, killed 5-sec RoPE stitch with LUFS)
+        #   → 15 (Phase 1c) — no visible benefit, reverted.
+        # Conclusion: motion_bucket_id_heads is NOT the right knob for the
+        # "cocaine opening" rushed-start issue. That problem is content-
+        # dependent (specific scripts trigger it) and likely needs either
+        # audio silence padding at clip start or RMS soft-clip on audio
+        # features. Sticking with 20 as the shipped value.
+        motion_bucket_id_heads = np.array([20] * 4)
         motion_bucket_id_exps = np.array([30] * 4)
         motion_bucket_id_heads = torch.from_numpy(motion_bucket_id_heads)
         motion_bucket_id_exps = torch.from_numpy(motion_bucket_id_exps)
