@@ -1121,7 +1121,7 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
         # that remained after simple-average overlap (Phase D v1).
         #
         # Cost: zero. Just changes the weight used when accumulating.
-        window_overlap = 8
+        window_overlap = 16    # doubled from 8 — 2.56 sec blend zone per boundary
         window_stride = max(1, frames_per_batch - window_overlap)
 
         # Precompute Hann (cosine²) window weights for blending.
