@@ -128,16 +128,15 @@ class VideoAudioTextLoaderVal(Dataset):
         audio_input, audio_len = get_audio_feature(self.feature_extractor, audio_path)
         audio_prompts = audio_input[0]
         
-        # Phase 1a smoothing: lower motion bucket head-pose ID from 25 → 20.
-        # Global damper on overall head sway amplitude — reduces visibility of
-        # residual jitter driven by audio_prompts variance between different
-        # scripts. See 2026-04-21 test: same settings, different Inworld scripts
-        # produced different smoothness (eba1650c/fdd91359 smooth,
-        # 7335db44/9a78f73b jumpy). This scalar reduces the motion the model is
-        # instructed to produce overall, making per-frame variance less visible.
-        # motion_bucket_id_exps left at 30 to preserve expression amplitude for
-        # lip sync.
-        motion_bucket_id_heads = np.array([20] * 4)
+        # Phase 1c smoothing: lower motion bucket head-pose ID 25 → 20 → 15.
+        # Earlier drop to 20 + LUFS killed the 5-sec RoPE-boundary stitch but
+        # left a "cocaine-head" rushed opening on scripts with dense audio
+        # openings (Hey-it's-Mike style). Dropping to 15 further damps global
+        # head-sway amplitude across all scripts. Tradeoff: calm scripts may
+        # look slightly under-motioned; if so, revert to 20 or introduce
+        # script-aware scaling. motion_bucket_id_exps stays at 30 to preserve
+        # expression amplitude for lip-sync accuracy.
+        motion_bucket_id_heads = np.array([15] * 4)
         motion_bucket_id_exps = np.array([30] * 4)
         motion_bucket_id_heads = torch.from_numpy(motion_bucket_id_heads)
         motion_bucket_id_exps = torch.from_numpy(motion_bucket_id_exps)
