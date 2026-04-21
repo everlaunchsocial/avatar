@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_stitch_source_url'",
+        "echo 'cache_bust_stitch_duration_flag'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -652,13 +652,19 @@ def stitch_endpoint(payload: dict):
             # libx264 preset=veryfast is a good balance for CPU-only render:
             # ~realtime for 1080p on 2 vCPU. Audio to AAC 192k.
             trimmed_file = os.path.join(tmp_dir, f"trim-{idx:02d}.mp4")
+            # Use -t (duration) instead of -to (timestamp-with-ambiguous-
+            # reference-point). -t after -i is unambiguously "output this
+            # many seconds" regardless of -ss positioning. Previous code
+            # used -to which produced incorrect segment lengths (seam
+            # appeared in wrong place). Fixed 2026-04-21.
+            duration_s = None if end_s is None else max(0.0, end_s - start_s)
             trim_args = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", f"{start_s:.3f}",
                 "-i", src_file,
             ]
-            if end_s is not None:
-                trim_args += ["-to", f"{end_s - start_s:.3f}"]
+            if duration_s is not None:
+                trim_args += ["-t", f"{duration_s:.3f}"]
             trim_args += [
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                 "-pix_fmt", "yuv420p",
