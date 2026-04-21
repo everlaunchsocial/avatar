@@ -593,7 +593,18 @@ def process_job(sb, engine, job):
         # predictable input.
         ap = jt / "input.wav"
         t0 = time.time()
-        ret = os.system(f"ffmpeg -i '{ap_raw}' -ar 16000 -ac 1 -y '{ap}' -loglevel quiet")
+        # Phase 1b smoothing: LUFS loudness normalization at -18 LUFS.
+        # Flattens amplitude dynamic range across different audio inputs so the
+        # same motion pipeline produces more consistent output regardless of
+        # script content. Without this, a plosive-heavy or emotionally-varied
+        # script creates amplitude transients that get amplified by Whisper +
+        # motion transformer and become visible jumps/stitches at window
+        # boundaries. See 2026-04-21: smooth Inworld script had no 5-sec stitch
+        # at 30-sec length; jumpy script did. LUFS normalization closes that
+        # gap by making the jumpy script's audio dynamic-range-match the smooth
+        # one. Single-pass mode for speed. TP=-1.5 peak headroom, LRA=11 =
+        # broadcast-standard dynamic range ceiling.
+        ret = os.system(f"ffmpeg -i '{ap_raw}' -af \"loudnorm=I=-18:TP=-1.5:LRA=11\" -ar 16000 -ac 1 -y '{ap}' -loglevel quiet")
         if ret != 0 or not ap.exists() or ap.stat().st_size == 0:
             log(f"audio normalization failed (ret={ret}), falling back to raw")
             ap = ap_raw
