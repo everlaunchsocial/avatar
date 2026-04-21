@@ -28,7 +28,7 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_window_overlap_8'",
+        "echo 'cache_bust_stitch_endpoint'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -77,6 +77,18 @@ image = (
 # Keys needed: SUPABASE_URL, SUPABASE_SERVICE_KEY
 # ─────────────────────────────────────────────────────────────
 supabase_secret = modal.Secret.from_name("supabase-keys")
+
+
+# ─────────────────────────────────────────────────────────────
+# STITCH IMAGE — lightweight CPU-only for ffmpeg concat.
+# No GPU, no Hunyuan, no CUDA. Just python + ffmpeg + supabase-py.
+# Cold start < 5 sec; stitch itself < 10 sec. Cost ~$0.001/stitch.
+# ─────────────────────────────────────────────────────────────
+stitch_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install(["supabase==2.3.0", "requests"])
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -529,3 +541,179 @@ def recent_jobs(limit: int = 10):
         "id,status,settings,created_at,updated_at,render_time_ms,error_message,output_url"
     ).order("created_at", desc=True).limit(int(limit)).execute()
     return {"count": len(res.data or []), "jobs": res.data or []}
+
+
+# ─────────────────────────────────────────────────────────────
+# STITCH ENDPOINT — concat/trim multiple existing renders into
+# a single output. CPU-only, no GPU, near-zero cost per call.
+#
+# Usage (JSON POST body):
+#   {
+#     "segments": [
+#       {"job_id": "<intro-uuid>",  "start": 0,  "end": 10},
+#       {"job_id": "<master-uuid>", "start": 10, "end": 30}
+#     ],
+#     "output_name": "affiliate-john-plumbing"   // optional
+#   }
+#
+# `start` / `end` are seconds from the source clip. Omit `end`
+# to mean "to end of clip".
+#
+# Returns:
+#   {
+#     "status": "done",
+#     "output_url": "https://.../stitched/<output_name>.mp4",
+#     "duration_sec": 30.0,
+#     "segments_used": 2,
+#     "ffmpeg_time_sec": 3.8,
+#     "total_time_sec": 6.5
+#   }
+#
+# Output stored at `rendered-videos/stitched/<output_name>.mp4`.
+# Pipeline: download each segment → re-encode with trim →
+# ffmpeg concat demuxer → upload → return URL.
+# ─────────────────────────────────────────────────────────────
+@app.function(
+    image=stitch_image,
+    secrets=[supabase_secret],
+    cpu=2,
+    memory=2048,
+    timeout=600,
+    max_containers=3,  # allow a few concurrent stitches (cheap, CPU-only)
+)
+@modal.fastapi_endpoint(method="POST")
+def stitch_endpoint(payload: dict):
+    import os, time, tempfile, shutil, subprocess, urllib.request, uuid
+    from datetime import datetime, timezone
+    from supabase import create_client
+
+    t_start = time.time()
+
+    segments = payload.get("segments") or []
+    if not isinstance(segments, list) or len(segments) == 0:
+        return {"status": "error", "error": "segments (non-empty list) is required"}
+
+    output_name = (
+        payload.get("output_name")
+        or f"stitch-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+    )
+    # sanitize output_name — no slashes, no dots
+    import re
+    output_name = re.sub(r"[^A-Za-z0-9_-]", "_", output_name)
+
+    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    BUCKET = "rendered-videos"
+
+    tmp_dir = tempfile.mkdtemp(prefix="stitch_")
+    trimmed_files = []
+    total_duration = 0.0
+
+    try:
+        # 1. For each segment: fetch row, download source MP4, trim with ffmpeg.
+        for idx, seg in enumerate(segments):
+            jid = seg.get("job_id")
+            if not jid:
+                return {"status": "error", "error": f"segment {idx} missing job_id"}
+            start_s = float(seg.get("start", 0))
+            end_s = seg.get("end")
+            if end_s is not None:
+                end_s = float(end_s)
+
+            # Lookup source URL from video_jobs
+            res = sb.table("video_jobs").select("output_url,status").eq("id", jid).execute()
+            if not res.data:
+                return {"status": "error", "error": f"job {jid} not found"}
+            row = res.data[0]
+            if row.get("status") != "done":
+                return {"status": "error", "error": f"job {jid} status is {row.get('status')} (need done)"}
+            src_url = row.get("output_url")
+            if not src_url:
+                return {"status": "error", "error": f"job {jid} has no output_url"}
+
+            # Download source
+            src_file = os.path.join(tmp_dir, f"src-{idx:02d}.mp4")
+            print(f"[stitch] seg {idx}: downloading {src_url}")
+            req = urllib.request.Request(src_url, headers={"User-Agent": "modal-stitch/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(src_file, "wb") as f:
+                shutil.copyfileobj(r, f)
+
+            # Trim + uniform re-encode (so concat -c copy works downstream).
+            # libx264 preset=veryfast is a good balance for CPU-only render:
+            # ~realtime for 1080p on 2 vCPU. Audio to AAC 192k.
+            trimmed_file = os.path.join(tmp_dir, f"trim-{idx:02d}.mp4")
+            trim_args = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-ss", f"{start_s:.3f}",
+                "-i", src_file,
+            ]
+            if end_s is not None:
+                trim_args += ["-to", f"{end_s - start_s:.3f}"]
+            trim_args += [
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                trimmed_file,
+            ]
+            subprocess.run(trim_args, check=True)
+            trimmed_files.append(trimmed_file)
+
+            if end_s is not None:
+                total_duration += (end_s - start_s)
+
+        # 2. Concat demuxer — safe and lossless since all trimmed files share codec.
+        concat_list = os.path.join(tmp_dir, "concat.txt")
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for fp in trimmed_files:
+                # ffmpeg concat demuxer requires file paths in `file '...'` form.
+                f.write(f"file '{fp}'\n")
+
+        output_file = os.path.join(tmp_dir, "stitched.mp4")
+        concat_args = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_file,
+        ]
+        t_ff = time.time()
+        subprocess.run(concat_args, check=True)
+        ffmpeg_time = time.time() - t_ff
+
+        # 3. Upload to Supabase under stitched/ prefix.
+        with open(output_file, "rb") as f:
+            body_bytes = f.read()
+        dest_path = f"stitched/{output_name}.mp4"
+        try:
+            sb.storage.from_(BUCKET).upload(
+                path=dest_path, file=body_bytes,
+                file_options={"content-type": "video/mp4", "upsert": "true"},
+            )
+        except Exception as e:
+            return {"status": "error", "error": f"supabase upload failed: {e}"}
+
+        public_url = sb.storage.from_(BUCKET).get_public_url(dest_path)
+        total_time = time.time() - t_start
+
+        print(f"[stitch] DONE {output_name} segments={len(segments)} "
+              f"duration={total_duration:.1f}s ffmpeg={ffmpeg_time:.1f}s total={total_time:.1f}s")
+
+        return {
+            "status": "done",
+            "output_url": public_url,
+            "output_name": output_name,
+            "duration_sec": round(total_duration, 2),
+            "segments_used": len(segments),
+            "size_bytes": len(body_bytes),
+            "ffmpeg_time_sec": round(ffmpeg_time, 2),
+            "total_time_sec": round(total_time, 2),
+        }
+
+    except subprocess.CalledProcessError as _cpe:
+        return {"status": "error", "error": f"ffmpeg failed: {_cpe}"}
+    except Exception as _e:
+        import traceback
+        return {"status": "error", "error": str(_e), "trace": traceback.format_exc()[:2000]}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
