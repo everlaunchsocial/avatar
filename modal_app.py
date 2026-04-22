@@ -714,7 +714,45 @@ def stitch_endpoint(payload: dict):
                 "-movflags", "+faststart",
                 trimmed_file,
             ]
-            subprocess.run(trim_args, check=True)
+            # Probe source for audio stream presence first. If the source
+            # has no audio track (some company master videos are silent /
+            # video-only), add a synthetic silent audio stream during trim
+            # so downstream concat filter (which requires v=1:a=1) works.
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "a",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", src_file],
+                capture_output=True, text=True,
+            )
+            has_audio = bool(probe.stdout.strip())
+            if not has_audio:
+                print(f"[stitch] seg {idx}: no audio in source, adding silence")
+                trim_args = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", src_file,
+                    "-f", "lavfi", "-t", "3600",
+                    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-ss", f"{start_s:.3f}",
+                ]
+                if duration_s is not None:
+                    trim_args += ["-t", f"{duration_s:.3f}"]
+                trim_args += [
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-shortest",
+                    "-movflags", "+faststart",
+                    trimmed_file,
+                ]
+            try:
+                subprocess.run(trim_args, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                return {
+                    "status": "error",
+                    "error": f"ffmpeg trim seg {idx} failed",
+                    "stderr": (e.stderr or "")[-2000:],
+                    "cmd": " ".join(trim_args),
+                }
             trimmed_files.append(trimmed_file)
 
             if end_s is not None:
@@ -744,7 +782,15 @@ def stitch_endpoint(payload: dict):
             output_file,
         ]
         t_ff = time.time()
-        subprocess.run(concat_args, check=True)
+        try:
+            subprocess.run(concat_args, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            return {
+                "status": "error",
+                "error": "ffmpeg concat failed",
+                "stderr": (e.stderr or "")[-2000:],
+                "cmd": " ".join(concat_args),
+            }
         ffmpeg_time = time.time() - t_ff
 
         # 3. Upload to Supabase under stitched/ prefix.
