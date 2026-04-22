@@ -498,6 +498,40 @@ def render_endpoint(
     if audio_url is not None:
         overrides["audio_url"] = audio_url
 
+    # Atomic claim BEFORE firing render_job. Without this, a row inserted
+    # by the Lovable edge function (status='pending') can be double-fired:
+    # once by this endpoint, and again by poll_pending_jobs 30s later,
+    # because process_job doesn't flip status='processing' until after
+    # model load / file download (30-60s into the render). That race
+    # caused users to pay 2x GPU cost per click.
+    #
+    # Pattern mirrors poll_pending_jobs (line 412-417): conditional
+    # UPDATE only succeeds if still pending. If another dispatcher already
+    # claimed this row, we short-circuit instead of starting a duplicate
+    # render.
+    import os as _os
+    from datetime import datetime, timezone
+    from supabase import create_client as _create_client
+    _sb_claim = _create_client(
+        _os.environ["SUPABASE_URL"],
+        _os.environ["SUPABASE_SERVICE_KEY"],
+    )
+    _now_iso = datetime.now(timezone.utc).isoformat()
+    _claim = _sb_claim.table("video_jobs").update({
+        "status": "processing",
+        "updated_at": _now_iso,
+    }).eq("id", job_id).eq("status", "pending").execute()
+    if not _claim.data:
+        # Row wasn't pending — either already claimed by poll_pending_jobs,
+        # already processing/done, or doesn't exist. Don't double-fire.
+        _existing = _sb_claim.table("video_jobs").select("id,status").eq("id", job_id).execute()
+        _current = _existing.data[0]["status"] if _existing.data else "not_found"
+        return {
+            "job_id": job_id,
+            "status": "skipped",
+            "reason": f"already {_current}; not re-firing to avoid duplicate render",
+        }
+
     renderer = AvatarRenderer()
     result = renderer.render_job.remote(job_id, overrides or None)
     return result
