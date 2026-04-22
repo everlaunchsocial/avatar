@@ -694,37 +694,40 @@ def stitch_endpoint(payload: dict):
             # appeared at cut. The cause was likely fast-seek keyframe
             # rounding. This switch fixes it.
             duration_s = None if end_s is None else max(0.0, end_s - start_s)
-            trim_args = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", src_file,
-                "-ss", f"{start_s:.3f}",  # NOW after -i (accurate seek)
-            ]
-            if duration_s is not None:
-                trim_args += ["-t", f"{duration_s:.3f}"]
-            trim_args += [
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
-                # No per-segment audio fade. Earlier attempt used 5ms
-                # fade-out + 5ms fade-in at each edge, but that created
-                # 10ms of near-silence at concat boundaries — heard as
-                # an audible duck/break in the middle of speech. The
-                # concat FILTER re-encodes audio samples in one pass
-                # which smooths any sample-level discontinuity naturally.
-                "-movflags", "+faststart",
-                trimmed_file,
-            ]
-            # Probe source for audio stream presence first. If the source
-            # has no audio track (some company master videos are silent /
-            # video-only), add a synthetic silent audio stream during trim
-            # so downstream concat filter (which requires v=1:a=1) works.
+            # Normalize all inputs to a common size so the concat filter
+            # doesn't reject on dimension mismatch. Target: 1080x1920
+            # portrait (standard avatar-video frame). Scale with aspect
+            # preserved + black letterbox/pillarbox padding. setsar=1 is
+            # required so concat doesn't also complain about pixel aspect.
+            NORMALIZE_VF = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+
+            # Probe source for audio stream presence. If the source has no
+            # audio track (some company master videos are silent / video-
+            # only), add a synthetic silent audio stream during trim so
+            # downstream concat filter (which requires v=1:a=1) works.
             probe = subprocess.run(
                 ["ffprobe", "-v", "quiet", "-select_streams", "a",
                  "-show_entries", "stream=index", "-of", "csv=p=0", src_file],
                 capture_output=True, text=True,
             )
             has_audio = bool(probe.stdout.strip())
-            if not has_audio:
+            if has_audio:
+                trim_args = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", src_file,
+                    "-ss", f"{start_s:.3f}",  # accurate seek
+                ]
+                if duration_s is not None:
+                    trim_args += ["-t", f"{duration_s:.3f}"]
+                trim_args += [
+                    "-vf", NORMALIZE_VF,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    trimmed_file,
+                ]
+            else:
                 print(f"[stitch] seg {idx}: no audio in source, adding silence")
                 trim_args = [
                     "ffmpeg", "-y", "-loglevel", "error",
@@ -737,6 +740,7 @@ def stitch_endpoint(payload: dict):
                     trim_args += ["-t", f"{duration_s:.3f}"]
                 trim_args += [
                     "-map", "0:v:0", "-map", "1:a:0",
+                    "-vf", NORMALIZE_VF,
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                     "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k",
