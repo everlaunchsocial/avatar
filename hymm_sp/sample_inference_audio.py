@@ -136,12 +136,18 @@ class HunyuanVideoSampler(Inference):
         # Phase 1e: aggressive audio feature fade-in at clip start.
         # User-reported "cocaine-head" lasts ~3 seconds on dense-opening scripts.
         # Phase 1d (0.5s fade, 0.3 start) had zero visible impact — too short
-        # and too high a floor. Bumping to 3s fade starting from 0.05
-        # (near-silence) to give the model a long glide from rest to full
-        # motion. If 3s silence at start feels awkward on calm scripts, cut
-        # the fade window or raise the start value.
+        # and too high a floor. Bumped to 3s fade starting from 0.05
+        # (near-silence). 2026-04-26 update: dropped start from 0.05 to 0.0
+        # because DJT's rerun (with 400ms pre-roll already enabled) STILL
+        # showed a head spin in the first second. With pre-roll = 750ms and
+        # motion_bucket_id_heads = 10 also in play, the fade-in is now the
+        # third attenuator: frame 0 has truly zero audio drive (not 5%),
+        # which means the model cannot generate "winding-up" head motion
+        # from the very first frame even if a phoneme starts immediately
+        # after pre-roll. Keep the 75-frame (3s) window — short windows
+        # already proved ineffective in Phase 1d.
         _fade_in_frames = int(getattr(args, "audio_fade_in_frames", 75))
-        _fade_in_start = float(getattr(args, "audio_fade_in_start", 0.05))
+        _fade_in_start = float(getattr(args, "audio_fade_in_start", 0.0))
         if _fade_in_frames > 0 and audio_prompts.shape[1] > _fade_in_frames:
             fade = torch.linspace(_fade_in_start, 1.0, _fade_in_frames,
                                    device=audio_prompts.device,

@@ -19,16 +19,64 @@ from torchvision.transforms import ToPILImage
 
 
 
-def get_audio_feature(feature_extractor, audio_path):
+def get_audio_feature(feature_extractor, audio_path, pre_roll_samples: int = 6400):
+    # 400ms silent pre-roll RE-ENABLED 2026-04-25 (evening): I had
+    # disabled this earlier today thinking it caused tensor-size mismatches
+    # in Hunyuan inference. Wrong call. The actual cause was
+    # image_size/wav2vec_gain/motion_scale fields in the settings payload
+    # (per Lovable's audit). Once those were removed from FACTORY_DEFAULTS
+    # in the edge functions, renders started succeeding cleanly — even
+    # WITHOUT pre-roll. So pre-roll is safe to re-enable for the original
+    # purpose: gives the avatar 10 frames at 25fps of silent idle motion
+    # before speech starts, preventing the "rushed/cocaine opening" that
+    # happens when frame 0 conditions on the first phoneme.
+    """
+    Load TTS audio and prepend a silent pre-roll buffer.
+
+    pre_roll_samples=6400 at 16kHz = 400ms = 10 video frames at 25fps.
+
+    Why: Hunyuan-Avatar conditions every output frame on its
+    corresponding chunk of audio embedding (Whisper features). Without
+    pre-roll, frame 0 of the video is generated from the first chunk
+    of audio — which is the first phoneme of speech. The model has
+    zero context for the avatar's idle pose / breathing / micro-motion
+    before speech starts, so the avatar 'snaps' from nothing into mid-
+    syllable. Reads as the 'cocaine opening' / rushed-start feel users
+    have reported on production renders.
+
+    Phase-1 iterations (April 21) explicitly identified silent pre-roll
+    as the correct fix — see comment in get_batch_data below at
+    motion_bucket_id_heads. Tuning motion_bucket_id_heads (25 -> 20 -> 15)
+    didn't help because the issue is audio-conditioning, not motion-bucket.
+
+    Pre-roll gives the model 10 frames where audio embeddings are near-
+    zero (silence), so it produces stable idle motion (closed mouth,
+    slight breathing, neutral pose) before any speech begins. The
+    transition into speech then happens from a settled state.
+
+    Stacks cleanly with the existing fade-in in sample_inference_audio.py
+    (75 frames, 0.05 -> 1.0): pre-roll handles 'avatar present, idle';
+    fade-in handles 'audio energy ramp into speech'. Together they
+    eliminate the rushed start.
+
+    Cost: each render is +400ms = +10 frames. Roughly +3% GPU time on
+    a 12-sec clip.
+    """
     audio_input, sampling_rate = librosa.load(audio_path, sr=16000)
     assert sampling_rate == 16000
+
+    if pre_roll_samples > 0:
+        audio_input = np.concatenate([
+            np.zeros(pre_roll_samples, dtype=audio_input.dtype),
+            audio_input,
+        ])
 
     audio_features = []
     window = 750*640
     for i in range(0, len(audio_input), window):
-        audio_feature = feature_extractor(audio_input[i:i+window], 
-                                        sampling_rate=sampling_rate, 
-                                        return_tensors="pt", 
+        audio_feature = feature_extractor(audio_input[i:i+window],
+                                        sampling_rate=sampling_rate,
+                                        return_tensors="pt",
                                         ).input_features
         audio_features.append(audio_feature)
 
@@ -128,15 +176,24 @@ class VideoAudioTextLoaderVal(Dataset):
         audio_input, audio_len = get_audio_feature(self.feature_extractor, audio_path)
         audio_prompts = audio_input[0]
         
-        # Production value after iterations 2026-04-21:
-        #   25 (original) → 20 (Phase 1a, killed 5-sec RoPE stitch with LUFS)
-        #   → 15 (Phase 1c) — no visible benefit, reverted.
-        # Conclusion: motion_bucket_id_heads is NOT the right knob for the
-        # "cocaine opening" rushed-start issue. That problem is content-
-        # dependent (specific scripts trigger it) and likely needs either
-        # audio silence padding at clip start or RMS soft-clip on audio
-        # features. Sticking with 20 as the shipped value.
-        motion_bucket_id_heads = np.array([20] * 4)
+        # Production value after iterations:
+        #   25 (original) → 20 (Apr 21, Phase 1a, killed 5-sec RoPE stitch
+        #   with LUFS) → 15 (Apr 21, Phase 1c) — no visible benefit, reverted
+        #   → 10 (2026-04-26 evening, head-spin fix).
+        #
+        # 2026-04-26 update: with 750ms pre-roll buffer NOW ALSO IN PLACE
+        # (see get_audio_feature pre_roll_samples=12000), DJT's rerun still
+        # showed a head spin in the first second of the rendered video.
+        # Conclusion: the 400ms version of pre-roll alone wasn't enough —
+        # the model has a non-trivial baseline head-motion magnitude that
+        # fires even on silent audio frames, and motion_bucket_id_heads is
+        # the direct knob for that magnitude. Dropping to 10 (vs 15 earlier
+        # which was tested IN ISOLATION without pre-roll, so apples-to-
+        # oranges) in combination with longer pre-roll and tighter fade-in
+        # should settle frame 0 into idle pose before speech begins.
+        # Stack: pre-roll (silent frames) + motion_bucket=10 (smaller head
+        # motion magnitude) + fade-in from 0.0 (no first-frame audio drive).
+        motion_bucket_id_heads = np.array([10] * 4)
         motion_bucket_id_exps = np.array([30] * 4)
         motion_bucket_id_heads = torch.from_numpy(motion_bucket_id_heads)
         motion_bucket_id_exps = torch.from_numpy(motion_bucket_id_exps)
