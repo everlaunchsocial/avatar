@@ -680,6 +680,169 @@ def process_job(sb, engine, job):
         sb.table("video_jobs").update({"status": "done", "output_url": pu, "render_time_ms": ms}).eq("id", jid).execute()
         log(f"=== job {jid} DONE {ms}ms versioned={versioned_sp} ===")
 
+        # ─────────────────────────────────────────────────────────────
+        # AFFILIATE_VIDEOS FINALIZATION (Apr 25)
+        #
+        # The browser-driven happy path was the single point of failure
+        # all day: Modal would complete, the render would be uploaded,
+        # but if the user closed the V6 wizard tab between render-done
+        # and stitch-complete, the affiliate_videos row stayed stuck at
+        # status='generating' forever. Reconciler cron catches some of
+        # these but is reactive (1 min latency) and depends on Lovable
+        # having pg_cron scheduled correctly.
+        #
+        # AUTHORITATIVE FIX: Modal writes back directly. Right here,
+        # right after the render is marked done, look up the
+        # affiliate_videos row this job belongs to (linked via
+        # did_talk_id), trigger the Modal stitch_endpoint internally,
+        # and write permanent_video_url + status='ready' on the row.
+        # No browser dependency. No edge function dependency. No reconciler
+        # dependency. Single source of truth: this Modal container.
+        #
+        # Wrapped in try/except so any failure here is logged but doesn't
+        # propagate — the render itself succeeded, this is post-processing
+        # that shouldn't be able to mark the render as failed.
+        # ─────────────────────────────────────────────────────────────
+        try:
+            log(f"[finalize] looking up affiliate_videos for job {jid}")
+            av_q = sb.table("affiliate_videos").select(
+                "id, affiliate_id, profile_id, permanent_video_url, status, provider"
+            ).eq("did_talk_id", jid).limit(1).execute()
+            av_rows = av_q.data or []
+            if not av_rows:
+                log(f"[finalize] no affiliate_videos row found for job {jid} (not an EverLaunch wizard render — skipping)")
+            else:
+                av = av_rows[0]
+                av_id = av["id"]
+                av_provider = av.get("provider")
+                if av_provider != "everlaunch":
+                    log(f"[finalize] av {av_id} provider={av_provider} — skipping stitch (only everlaunch finalizes here)")
+                elif av.get("status") == "ready" and av.get("permanent_video_url"):
+                    log(f"[finalize] av {av_id} already ready — skipping (idempotent)")
+                else:
+                    log(f"[finalize] av {av_id} provider=everlaunch status={av.get('status')} — proceeding with stitch")
+
+                    # Atomic claim: only proceed if status is in-flight.
+                    sb.table("affiliate_videos").update({
+                        "status": "generating",  # stitching not in enum; keep generating
+                        "error_message": None,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", av_id).execute()
+
+                    # ─── PHASE 0 (2026-05-06): Cache raw Hunyuan intro URL ─────────
+                    # The body-library auto-routing pipeline (Phase A onwards in
+                    # espocrm-boost) re-stitches this raw 12-sec talking-head
+                    # clip against different vertical body videos (lawyer,
+                    # plumber, dental, etc.) without re-running the GPU.
+                    #
+                    # CRITICAL: cache `pu` (the raw output_url from the Hunyuan
+                    # render), NOT the stitched URL produced below. We need the
+                    # unstitched 12-sec clip so we can re-stitch with different
+                    # bodies later. Caching the post-stitch composite would lock
+                    # us to the generic body forever.
+                    #
+                    # Always overwrites: latest render wins. Handles avatar
+                    # rebuild — new render produces new clip → new cache value →
+                    # downstream Phase A orchestrator (when shipped) sees the
+                    # change and re-fans out the 30 vertical stitches.
+                    #
+                    # Wrapped in try/except: cache failure is non-fatal. The
+                    # render itself succeeded; the stitch will still fire below.
+                    # Worst case the affiliate's library doesn't auto-populate
+                    # and they fall back to the generic in the resolver.
+                    #
+                    # NOTE for Phase A wiring: this is where the webhook POST
+                    # to the Lovable orchestrator edge function will go. Format:
+                    #   POST {LOVABLE_URL}/functions/v1/orchestrate-library-stitches
+                    #   body: {"affiliate_id": av["affiliate_id"], "profile_id": profile_id}
+                    # Not added yet — wait for Lovable to ship the endpoint
+                    # before adding the call here.
+                    profile_id = av.get("profile_id")
+                    if profile_id:
+                        try:
+                            sb.table("affiliate_avatar_profiles").update({
+                                "cached_customer_intro_url": pu,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            }).eq("id", profile_id).execute()
+                            log(f"[finalize] cached raw intro on profile {profile_id}")
+                        except Exception as cache_err:
+                            log(f"[finalize] cache_intro_url failed (non-fatal): {cache_err}")
+                    else:
+                        log(f"[finalize] av {av_id} has no profile_id — cannot cache intro URL")
+
+                    # Resolve company body URL
+                    COMPANY_AFFILIATE_ID = "438c636d-cdea-4863-9fc3-2650aae43c1a"
+                    DEFAULT_BODY_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/438c636d-cdea-4863-9fc3-2650aae43c1a/29fc6528-0428-4a79-9234-007ae92394bf-1769707727045.mp4"
+                    DEFAULT_STING_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/branding/everlaunch-sting-v1.mp4"
+                    DEFAULT_CARD_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/branding/everlaunch-card-v1.mp4"
+                    body_q = sb.table("affiliate_videos").select("permanent_video_url").eq(
+                        "affiliate_id", COMPANY_AFFILIATE_ID
+                    ).eq("status", "ready").eq("video_type", "generic").eq("is_archived", False).order(
+                        "created_at", desc=True
+                    ).limit(1).execute()
+                    body_url = (body_q.data[0]["permanent_video_url"]
+                                if body_q.data and body_q.data[0].get("permanent_video_url")
+                                else DEFAULT_BODY_URL)
+
+                    # Fire Modal stitch_endpoint. Follows manual redirect
+                    # for Modal's 303 async polling pattern.
+                    stitch_url = "https://everlaunchsocial--everlaunch-avatar-stitch-endpoint.modal.run"
+                    payload = {
+                        "segments": [
+                            {"source_url": DEFAULT_CARD_URL},
+                            {"source_url": pu},
+                            {"source_url": DEFAULT_STING_URL},
+                            {"source_url": body_url},
+                        ],
+                        "output_name": f"everlaunch-{av_id}",
+                        "target_aspect": "landscape",
+                    }
+                    log(f"[finalize] firing stitch for av {av_id}")
+                    import requests as _req
+                    sresp = _req.post(stitch_url, json=payload, timeout=300, allow_redirects=False)
+
+                    # Handle 200 sync OR 303 async
+                    if sresp.status_code == 200:
+                        sj = sresp.json()
+                    elif sresp.status_code in (302, 303):
+                        loc = sresp.headers.get("Location")
+                        log(f"[finalize] async polling {loc}")
+                        deadline = time.time() + 300
+                        sj = None
+                        while time.time() < deadline:
+                            time.sleep(4)
+                            pr = _req.get(loc, timeout=30, allow_redirects=False)
+                            if pr.status_code == 200:
+                                sj = pr.json()
+                                break
+                            if pr.status_code not in (202, 302, 303):
+                                raise Exception(f"Poll error {pr.status_code}: {pr.text[:200]}")
+                        if sj is None:
+                            raise Exception("Stitch polling timed out (>5 min)")
+                    else:
+                        raise Exception(f"Stitch returned {sresp.status_code}: {sresp.text[:200]}")
+
+                    if sj.get("status") == "done" and sj.get("output_url"):
+                        stitched_url = sj["output_url"]
+                        sb.table("affiliate_videos").update({
+                            "permanent_video_url": stitched_url,
+                            "did_video_url": stitched_url,
+                            "status": "ready",
+                            "error_message": None,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }).eq("id", av_id).execute()
+                        log(f"[finalize] av {av_id} -> READY url={stitched_url}")
+                    else:
+                        err = sj.get("error") or sj.get("stderr") or f"stitch payload: {str(sj)[:200]}"
+                        sb.table("affiliate_videos").update({
+                            "status": "failed",
+                            "error_message": f"Stitch failed: {str(err)[:400]}",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }).eq("id", av_id).execute()
+                        log(f"[finalize] av {av_id} -> FAILED: {err}")
+        except Exception as _fin_exc:
+            log(f"[finalize] non-fatal exception: {_fin_exc}\n{traceback.format_exc()[-1500:]}")
+
     except Exception as e:
         log(f"FAILED:\n{traceback.format_exc()}")
         fail_job(sb, jid, str(e)[:2000])
