@@ -770,6 +770,52 @@ def process_job(sb, engine, job):
                     else:
                         log(f"[finalize] av {av_id} has no profile_id — cannot cache intro URL")
 
+                    # ─── PHASE A (2026-05-06): Orchestrator dispatch ──────────────
+                    # Fire-and-forget POST to the Lovable orchestrator that
+                    # fans out 30 library stitches per affiliate. The
+                    # orchestrator returns 202 in <5s after creating queue
+                    # rows; the actual 30 stitches happen in its background
+                    # over ~2-3 min via the stitch-affiliate-video-from-library
+                    # edge function. This is what makes the auto-routing
+                    # pipeline self-run end-to-end after a V6 wizard
+                    # completes — the affiliate's library auto-populates
+                    # without any browser/UI involvement.
+                    #
+                    # Wrapped in try/except: orchestrator failure is
+                    # non-fatal. The render and the V6 wizard's single
+                    # stitch (below) both still complete successfully.
+                    # If the orchestrator misses, the affiliate's main
+                    # video still ships; only their auto-stitched library
+                    # is delayed (recoverable by re-invoking the
+                    # orchestrator manually with the affiliate_id).
+                    #
+                    # Short 10-second timeout: the orchestrator returns 202
+                    # within ~5 sec. Anything longer means something is
+                    # wrong on Lovable's side and we shouldn't block the
+                    # render's main stitch waiting on it.
+                    affiliate_id_for_orch = av.get("affiliate_id")
+                    if affiliate_id_for_orch:
+                        try:
+                            import requests as _req_orch
+                            _orch_resp = _req_orch.post(
+                                "https://mrcfpbkoulldnkqzzprb.supabase.co/functions/v1/orchestrate-library-stitches",
+                                headers={
+                                    "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+                                    "Content-Type": "application/json",
+                                },
+                                json={"affiliate_id": affiliate_id_for_orch},
+                                timeout=10,
+                            )
+                            if _orch_resp.status_code == 202:
+                                log(f"[finalize] orchestrator dispatched 30 library stitches for affiliate {affiliate_id_for_orch}")
+                            elif _orch_resp.status_code == 200:
+                                # 200 = skipped_company_only or empty body library
+                                log(f"[finalize] orchestrator returned 200 (likely company-only avatar): {_orch_resp.text[:200]}")
+                            else:
+                                log(f"[finalize] orchestrator returned {_orch_resp.status_code} (non-fatal): {_orch_resp.text[:200]}")
+                        except Exception as orch_err:
+                            log(f"[finalize] orchestrator dispatch failed (non-fatal): {orch_err}")
+
                     # Resolve company body URL
                     COMPANY_AFFILIATE_ID = "438c636d-cdea-4863-9fc3-2650aae43c1a"
                     DEFAULT_BODY_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/438c636d-cdea-4863-9fc3-2650aae43c1a/29fc6528-0428-4a79-9234-007ae92394bf-1769707727045.mp4"
