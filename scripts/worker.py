@@ -715,10 +715,88 @@ def process_job(sb, engine, job):
                 av = av_rows[0]
                 av_id = av["id"]
                 av_provider = av.get("provider")
+
+                # ─── ALWAYS for everlaunch renders (2026-05-07 fix) ───
+                # Cache write + orchestrator dispatch run BEFORE the
+                # stitch gate. Reason: the legacy stitch path can be
+                # claimed by a competing finalizer (Lovable's
+                # check-everlaunch-video-status edge fn, or the
+                # reconciler cron) before this worker.py reaches the
+                # stitch block. Previously these two blocks were INSIDE
+                # the stitch branch and got silently skipped whenever
+                # the affiliate_videos row was already 'ready' with a
+                # permanent_video_url — meaning the orchestrator never
+                # fired for fast-finalized renders, and the affiliate's
+                # 30-video library never auto-populated.
+                #
+                # Both blocks below are idempotent (UPSERT cache,
+                # UPSERT queue rows on (affiliate_id, body_slug)). Safe
+                # to fire even if the row was finalized elsewhere — at
+                # worst we overwrite with the same data; at best we
+                # finally trigger the library build that was missed.
+                if av_provider == "everlaunch":
+                    # ─── PHASE 0: Cache raw Hunyuan intro URL ─────────
+                    # The body-library auto-routing pipeline re-stitches
+                    # this raw 12-sec talking-head clip against different
+                    # vertical body videos (plumbing, hvac, dental, etc.)
+                    # without re-running the GPU.
+                    #
+                    # CRITICAL: cache `pu` (the raw output_url from the
+                    # Hunyuan render), NOT the stitched URL produced
+                    # below. We need the unstitched 12-sec clip to
+                    # re-stitch with different bodies later. Caching the
+                    # post-stitch composite would lock us to the generic
+                    # body forever.
+                    profile_id_cache = av.get("profile_id")
+                    if profile_id_cache:
+                        try:
+                            sb.table("affiliate_avatar_profiles").update({
+                                "cached_customer_intro_url": pu,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            }).eq("id", profile_id_cache).execute()
+                            log(f"[finalize] cached raw intro on profile {profile_id_cache}")
+                        except Exception as cache_err:
+                            log(f"[finalize] cache_intro_url failed (non-fatal): {cache_err}")
+                    else:
+                        log(f"[finalize] av {av_id} has no profile_id — cannot cache intro URL")
+
+                    # ─── PHASE A: Orchestrator dispatch ───────────────
+                    # Fire-and-forget POST to the Lovable orchestrator
+                    # that fans out 30 library stitches per affiliate.
+                    # Returns 202 in <5s after creating queue rows; the
+                    # actual 30 stitches happen in its background over
+                    # ~2-3 min via stitch-affiliate-video-from-library.
+                    # This is what makes the pipeline self-run end-to-
+                    # end without browser/UI involvement.
+                    affiliate_id_for_orch_v2 = av.get("affiliate_id")
+                    if affiliate_id_for_orch_v2:
+                        try:
+                            import requests as _req_orch
+                            _orch_resp = _req_orch.post(
+                                "https://mrcfpbkoulldnkqzzprb.supabase.co/functions/v1/orchestrate-library-stitches",
+                                headers={
+                                    "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+                                    "Content-Type": "application/json",
+                                },
+                                json={"affiliate_id": affiliate_id_for_orch_v2},
+                                timeout=10,
+                            )
+                            if _orch_resp.status_code == 202:
+                                log(f"[finalize] orchestrator dispatched 30 library stitches for affiliate {affiliate_id_for_orch_v2}")
+                            elif _orch_resp.status_code == 200:
+                                # 200 = skipped_company_only or empty body library
+                                log(f"[finalize] orchestrator returned 200 (likely company-only avatar): {_orch_resp.text[:200]}")
+                            else:
+                                log(f"[finalize] orchestrator returned {_orch_resp.status_code} (non-fatal): {_orch_resp.text[:200]}")
+                        except Exception as orch_err:
+                            log(f"[finalize] orchestrator dispatch failed (non-fatal): {orch_err}")
+
+                # ─── STITCH GATE: only run the legacy stitch if the ──
+                # row hasn't already been finalized by a competing path.
                 if av_provider != "everlaunch":
                     log(f"[finalize] av {av_id} provider={av_provider} — skipping stitch (only everlaunch finalizes here)")
                 elif av.get("status") == "ready" and av.get("permanent_video_url"):
-                    log(f"[finalize] av {av_id} already ready — skipping (idempotent)")
+                    log(f"[finalize] av {av_id} already ready — skipping stitch (idempotent)")
                 else:
                     log(f"[finalize] av {av_id} provider=everlaunch status={av.get('status')} — proceeding with stitch")
 
@@ -728,93 +806,6 @@ def process_job(sb, engine, job):
                         "error_message": None,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }).eq("id", av_id).execute()
-
-                    # ─── PHASE 0 (2026-05-06): Cache raw Hunyuan intro URL ─────────
-                    # The body-library auto-routing pipeline (Phase A onwards in
-                    # espocrm-boost) re-stitches this raw 12-sec talking-head
-                    # clip against different vertical body videos (lawyer,
-                    # plumber, dental, etc.) without re-running the GPU.
-                    #
-                    # CRITICAL: cache `pu` (the raw output_url from the Hunyuan
-                    # render), NOT the stitched URL produced below. We need the
-                    # unstitched 12-sec clip so we can re-stitch with different
-                    # bodies later. Caching the post-stitch composite would lock
-                    # us to the generic body forever.
-                    #
-                    # Always overwrites: latest render wins. Handles avatar
-                    # rebuild — new render produces new clip → new cache value →
-                    # downstream Phase A orchestrator (when shipped) sees the
-                    # change and re-fans out the 30 vertical stitches.
-                    #
-                    # Wrapped in try/except: cache failure is non-fatal. The
-                    # render itself succeeded; the stitch will still fire below.
-                    # Worst case the affiliate's library doesn't auto-populate
-                    # and they fall back to the generic in the resolver.
-                    #
-                    # NOTE for Phase A wiring: this is where the webhook POST
-                    # to the Lovable orchestrator edge function will go. Format:
-                    #   POST {LOVABLE_URL}/functions/v1/orchestrate-library-stitches
-                    #   body: {"affiliate_id": av["affiliate_id"], "profile_id": profile_id}
-                    # Not added yet — wait for Lovable to ship the endpoint
-                    # before adding the call here.
-                    profile_id = av.get("profile_id")
-                    if profile_id:
-                        try:
-                            sb.table("affiliate_avatar_profiles").update({
-                                "cached_customer_intro_url": pu,
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            }).eq("id", profile_id).execute()
-                            log(f"[finalize] cached raw intro on profile {profile_id}")
-                        except Exception as cache_err:
-                            log(f"[finalize] cache_intro_url failed (non-fatal): {cache_err}")
-                    else:
-                        log(f"[finalize] av {av_id} has no profile_id — cannot cache intro URL")
-
-                    # ─── PHASE A (2026-05-06): Orchestrator dispatch ──────────────
-                    # Fire-and-forget POST to the Lovable orchestrator that
-                    # fans out 30 library stitches per affiliate. The
-                    # orchestrator returns 202 in <5s after creating queue
-                    # rows; the actual 30 stitches happen in its background
-                    # over ~2-3 min via the stitch-affiliate-video-from-library
-                    # edge function. This is what makes the auto-routing
-                    # pipeline self-run end-to-end after a V6 wizard
-                    # completes — the affiliate's library auto-populates
-                    # without any browser/UI involvement.
-                    #
-                    # Wrapped in try/except: orchestrator failure is
-                    # non-fatal. The render and the V6 wizard's single
-                    # stitch (below) both still complete successfully.
-                    # If the orchestrator misses, the affiliate's main
-                    # video still ships; only their auto-stitched library
-                    # is delayed (recoverable by re-invoking the
-                    # orchestrator manually with the affiliate_id).
-                    #
-                    # Short 10-second timeout: the orchestrator returns 202
-                    # within ~5 sec. Anything longer means something is
-                    # wrong on Lovable's side and we shouldn't block the
-                    # render's main stitch waiting on it.
-                    affiliate_id_for_orch = av.get("affiliate_id")
-                    if affiliate_id_for_orch:
-                        try:
-                            import requests as _req_orch
-                            _orch_resp = _req_orch.post(
-                                "https://mrcfpbkoulldnkqzzprb.supabase.co/functions/v1/orchestrate-library-stitches",
-                                headers={
-                                    "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
-                                    "Content-Type": "application/json",
-                                },
-                                json={"affiliate_id": affiliate_id_for_orch},
-                                timeout=10,
-                            )
-                            if _orch_resp.status_code == 202:
-                                log(f"[finalize] orchestrator dispatched 30 library stitches for affiliate {affiliate_id_for_orch}")
-                            elif _orch_resp.status_code == 200:
-                                # 200 = skipped_company_only or empty body library
-                                log(f"[finalize] orchestrator returned 200 (likely company-only avatar): {_orch_resp.text[:200]}")
-                            else:
-                                log(f"[finalize] orchestrator returned {_orch_resp.status_code} (non-fatal): {_orch_resp.text[:200]}")
-                        except Exception as orch_err:
-                            log(f"[finalize] orchestrator dispatch failed (non-fatal): {orch_err}")
 
                     # Resolve company body URL
                     COMPANY_AFFILIATE_ID = "438c636d-cdea-4863-9fc3-2650aae43c1a"
