@@ -19,8 +19,25 @@ if not dist.is_initialized():
 import requests
 from supabase import create_client, Client
 
+# ─── BUILD FINGERPRINT (2026-05-07) ──────────────────────────────
+# Bump this string every time worker.py changes shape. Modal warm
+# containers live for hours, and "did the deploy actually take?" is
+# unanswerable from logs without a marker. Every container start AND
+# every finalize block emits this string so we can prove from logs
+# which version of the code is running.
+#
+# Naming: fpN-<short-sha-of-prior-code-state>-<one-word-marker>
+# fp2-c6123eb-fingerprint = first fingerprint run, code shape is
+# c6123eb (cache + orchestrator hoisted above stitch gate).
+BUILD_ID = "fp2-c6123eb-fingerprint"
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+# AI #2's flag: env var name mismatch is a known silent-failure cause.
+# Some Lovable edge fns expect SUPABASE_SERVICE_ROLE_KEY; Modal's
+# secret may have been provisioned under either name. Probe both at
+# boot and log which one resolved so we can stop guessing.
+_SVC_KEY_ROLE_FALLBACK = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 WORKSPACE = Path("/workspace/HunyuanVideo-Avatar")
 MODEL_BASE = os.environ.get("MODEL_BASE", str(WORKSPACE / "weights"))
@@ -704,17 +721,19 @@ def process_job(sb, engine, job):
         # that shouldn't be able to mark the render as failed.
         # ─────────────────────────────────────────────────────────────
         try:
+            log(f"[finalize] BUILD_ID={BUILD_ID} entered finalize block for job {jid}")
             log(f"[finalize] looking up affiliate_videos for job {jid}")
             av_q = sb.table("affiliate_videos").select(
                 "id, affiliate_id, profile_id, permanent_video_url, status, provider"
             ).eq("did_talk_id", jid).limit(1).execute()
             av_rows = av_q.data or []
             if not av_rows:
-                log(f"[finalize] no affiliate_videos row found for job {jid} (not an EverLaunch wizard render — skipping)")
+                log(f"[finalize] no affiliate_videos row found for job {jid} (did_talk_id mismatch or not an EverLaunch wizard render — skipping)")
             else:
                 av = av_rows[0]
                 av_id = av["id"]
                 av_provider = av.get("provider")
+                log(f"[finalize] BUILD_ID={BUILD_ID} av_id={av_id} provider={av_provider} status={av.get('status')} profile_id={av.get('profile_id')} has_url={bool(av.get('permanent_video_url'))}")
 
                 # ─── ALWAYS for everlaunch renders (2026-05-07 fix) ───
                 # Cache write + orchestrator dispatch run BEFORE the
@@ -735,6 +754,7 @@ def process_job(sb, engine, job):
                 # worst we overwrite with the same data; at best we
                 # finally trigger the library build that was missed.
                 if av_provider == "everlaunch":
+                    log(f"[finalize] BUILD_ID={BUILD_ID} entering cache+orchestrator block (provider=everlaunch)")
                     # ─── PHASE 0: Cache raw Hunyuan intro URL ─────────
                     # The body-library auto-routing pipeline re-stitches
                     # this raw 12-sec talking-head clip against different
@@ -897,6 +917,15 @@ def process_job(sb, engine, job):
 # ============================================================
 def main():
     ensure_env()
+    # ─── FINGERPRINT BANNER ───────────────────────────────────────
+    # Loud, easy to grep in Modal logs. If you don't see this line in
+    # the logs for a fresh job, the worker isn't running this code.
+    log(f"=========================================================")
+    log(f"=== BUILD_ID={BUILD_ID} ===")
+    log(f"=== STARTED_AT={datetime.now(timezone.utc).isoformat()} ===")
+    log(f"=== SUPABASE_SERVICE_KEY_set={SUPABASE_SERVICE_KEY is not None} ===")
+    log(f"=== SUPABASE_SERVICE_ROLE_KEY_fallback_set={_SVC_KEY_ROLE_FALLBACK is not None} ===")
+    log(f"=========================================================")
     log("starting")
     log(f"supabase: {SUPABASE_URL}")
     log(f"workspace: {WORKSPACE}")
