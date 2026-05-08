@@ -19,8 +19,25 @@ if not dist.is_initialized():
 import requests
 from supabase import create_client, Client
 
+# ─── BUILD FINGERPRINT (2026-05-07) ──────────────────────────────
+# Bump this string every time worker.py changes shape. Modal warm
+# containers live for hours, and "did the deploy actually take?" is
+# unanswerable from logs without a marker. Every container start AND
+# every finalize block emits this string so we can prove from logs
+# which version of the code is running.
+#
+# Naming: fpN-<short-sha-of-prior-code-state>-<one-word-marker>
+# fp2-c6123eb-fingerprint = first fingerprint run, code shape is
+# c6123eb (cache + orchestrator hoisted above stitch gate).
+BUILD_ID = "fp2-c6123eb-fingerprint"
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+# AI #2's flag: env var name mismatch is a known silent-failure cause.
+# Some Lovable edge fns expect SUPABASE_SERVICE_ROLE_KEY; Modal's
+# secret may have been provisioned under either name. Probe both at
+# boot and log which one resolved so we can stop guessing.
+_SVC_KEY_ROLE_FALLBACK = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 WORKSPACE = Path("/workspace/HunyuanVideo-Avatar")
 MODEL_BASE = os.environ.get("MODEL_BASE", str(WORKSPACE / "weights"))
@@ -593,7 +610,18 @@ def process_job(sb, engine, job):
         # predictable input.
         ap = jt / "input.wav"
         t0 = time.time()
-        ret = os.system(f"ffmpeg -i '{ap_raw}' -ar 16000 -ac 1 -y '{ap}' -loglevel quiet")
+        # Phase 1b smoothing: LUFS loudness normalization at -18 LUFS.
+        # Flattens amplitude dynamic range across different audio inputs so the
+        # same motion pipeline produces more consistent output regardless of
+        # script content. Without this, a plosive-heavy or emotionally-varied
+        # script creates amplitude transients that get amplified by Whisper +
+        # motion transformer and become visible jumps/stitches at window
+        # boundaries. See 2026-04-21: smooth Inworld script had no 5-sec stitch
+        # at 30-sec length; jumpy script did. LUFS normalization closes that
+        # gap by making the jumpy script's audio dynamic-range-match the smooth
+        # one. Single-pass mode for speed. TP=-1.5 peak headroom, LRA=11 =
+        # broadcast-standard dynamic range ceiling.
+        ret = os.system(f"ffmpeg -i '{ap_raw}' -af \"loudnorm=I=-18:TP=-1.5:LRA=11\" -ar 16000 -ac 1 -y '{ap}' -loglevel quiet")
         if ret != 0 or not ap.exists() or ap.stat().st_size == 0:
             log(f"audio normalization failed (ret={ret}), falling back to raw")
             ap = ap_raw
@@ -669,6 +697,209 @@ def process_job(sb, engine, job):
         sb.table("video_jobs").update({"status": "done", "output_url": pu, "render_time_ms": ms}).eq("id", jid).execute()
         log(f"=== job {jid} DONE {ms}ms versioned={versioned_sp} ===")
 
+        # ─────────────────────────────────────────────────────────────
+        # AFFILIATE_VIDEOS FINALIZATION (Apr 25)
+        #
+        # The browser-driven happy path was the single point of failure
+        # all day: Modal would complete, the render would be uploaded,
+        # but if the user closed the V6 wizard tab between render-done
+        # and stitch-complete, the affiliate_videos row stayed stuck at
+        # status='generating' forever. Reconciler cron catches some of
+        # these but is reactive (1 min latency) and depends on Lovable
+        # having pg_cron scheduled correctly.
+        #
+        # AUTHORITATIVE FIX: Modal writes back directly. Right here,
+        # right after the render is marked done, look up the
+        # affiliate_videos row this job belongs to (linked via
+        # did_talk_id), trigger the Modal stitch_endpoint internally,
+        # and write permanent_video_url + status='ready' on the row.
+        # No browser dependency. No edge function dependency. No reconciler
+        # dependency. Single source of truth: this Modal container.
+        #
+        # Wrapped in try/except so any failure here is logged but doesn't
+        # propagate — the render itself succeeded, this is post-processing
+        # that shouldn't be able to mark the render as failed.
+        # ─────────────────────────────────────────────────────────────
+        try:
+            log(f"[finalize] BUILD_ID={BUILD_ID} entered finalize block for job {jid}")
+            log(f"[finalize] looking up affiliate_videos for job {jid}")
+            av_q = sb.table("affiliate_videos").select(
+                "id, affiliate_id, profile_id, permanent_video_url, status, provider"
+            ).eq("did_talk_id", jid).limit(1).execute()
+            av_rows = av_q.data or []
+            if not av_rows:
+                log(f"[finalize] no affiliate_videos row found for job {jid} (did_talk_id mismatch or not an EverLaunch wizard render — skipping)")
+            else:
+                av = av_rows[0]
+                av_id = av["id"]
+                av_provider = av.get("provider")
+                log(f"[finalize] BUILD_ID={BUILD_ID} av_id={av_id} provider={av_provider} status={av.get('status')} profile_id={av.get('profile_id')} has_url={bool(av.get('permanent_video_url'))}")
+
+                # ─── ALWAYS for everlaunch renders (2026-05-07 fix) ───
+                # Cache write + orchestrator dispatch run BEFORE the
+                # stitch gate. Reason: the legacy stitch path can be
+                # claimed by a competing finalizer (Lovable's
+                # check-everlaunch-video-status edge fn, or the
+                # reconciler cron) before this worker.py reaches the
+                # stitch block. Previously these two blocks were INSIDE
+                # the stitch branch and got silently skipped whenever
+                # the affiliate_videos row was already 'ready' with a
+                # permanent_video_url — meaning the orchestrator never
+                # fired for fast-finalized renders, and the affiliate's
+                # 30-video library never auto-populated.
+                #
+                # Both blocks below are idempotent (UPSERT cache,
+                # UPSERT queue rows on (affiliate_id, body_slug)). Safe
+                # to fire even if the row was finalized elsewhere — at
+                # worst we overwrite with the same data; at best we
+                # finally trigger the library build that was missed.
+                if av_provider == "everlaunch":
+                    log(f"[finalize] BUILD_ID={BUILD_ID} entering cache+orchestrator block (provider=everlaunch)")
+                    # ─── PHASE 0: Cache raw Hunyuan intro URL ─────────
+                    # The body-library auto-routing pipeline re-stitches
+                    # this raw 12-sec talking-head clip against different
+                    # vertical body videos (plumbing, hvac, dental, etc.)
+                    # without re-running the GPU.
+                    #
+                    # CRITICAL: cache `pu` (the raw output_url from the
+                    # Hunyuan render), NOT the stitched URL produced
+                    # below. We need the unstitched 12-sec clip to
+                    # re-stitch with different bodies later. Caching the
+                    # post-stitch composite would lock us to the generic
+                    # body forever.
+                    profile_id_cache = av.get("profile_id")
+                    if profile_id_cache:
+                        try:
+                            sb.table("affiliate_avatar_profiles").update({
+                                "cached_customer_intro_url": pu,
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            }).eq("id", profile_id_cache).execute()
+                            log(f"[finalize] cached raw intro on profile {profile_id_cache}")
+                        except Exception as cache_err:
+                            log(f"[finalize] cache_intro_url failed (non-fatal): {cache_err}")
+                    else:
+                        log(f"[finalize] av {av_id} has no profile_id — cannot cache intro URL")
+
+                    # ─── PHASE A: Orchestrator dispatch ───────────────
+                    # Fire-and-forget POST to the Lovable orchestrator
+                    # that fans out 30 library stitches per affiliate.
+                    # Returns 202 in <5s after creating queue rows; the
+                    # actual 30 stitches happen in its background over
+                    # ~2-3 min via stitch-affiliate-video-from-library.
+                    # This is what makes the pipeline self-run end-to-
+                    # end without browser/UI involvement.
+                    affiliate_id_for_orch_v2 = av.get("affiliate_id")
+                    if affiliate_id_for_orch_v2:
+                        try:
+                            import requests as _req_orch
+                            _orch_resp = _req_orch.post(
+                                "https://mrcfpbkoulldnkqzzprb.supabase.co/functions/v1/orchestrate-library-stitches",
+                                headers={
+                                    "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+                                    "Content-Type": "application/json",
+                                },
+                                json={"affiliate_id": affiliate_id_for_orch_v2},
+                                timeout=10,
+                            )
+                            if _orch_resp.status_code == 202:
+                                log(f"[finalize] orchestrator dispatched 30 library stitches for affiliate {affiliate_id_for_orch_v2}")
+                            elif _orch_resp.status_code == 200:
+                                # 200 = skipped_company_only or empty body library
+                                log(f"[finalize] orchestrator returned 200 (likely company-only avatar): {_orch_resp.text[:200]}")
+                            else:
+                                log(f"[finalize] orchestrator returned {_orch_resp.status_code} (non-fatal): {_orch_resp.text[:200]}")
+                        except Exception as orch_err:
+                            log(f"[finalize] orchestrator dispatch failed (non-fatal): {orch_err}")
+
+                # ─── STITCH GATE: only run the legacy stitch if the ──
+                # row hasn't already been finalized by a competing path.
+                if av_provider != "everlaunch":
+                    log(f"[finalize] av {av_id} provider={av_provider} — skipping stitch (only everlaunch finalizes here)")
+                elif av.get("status") == "ready" and av.get("permanent_video_url"):
+                    log(f"[finalize] av {av_id} already ready — skipping stitch (idempotent)")
+                else:
+                    log(f"[finalize] av {av_id} provider=everlaunch status={av.get('status')} — proceeding with stitch")
+
+                    # Atomic claim: only proceed if status is in-flight.
+                    sb.table("affiliate_videos").update({
+                        "status": "generating",  # stitching not in enum; keep generating
+                        "error_message": None,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }).eq("id", av_id).execute()
+
+                    # Resolve company body URL
+                    COMPANY_AFFILIATE_ID = "438c636d-cdea-4863-9fc3-2650aae43c1a"
+                    DEFAULT_BODY_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/438c636d-cdea-4863-9fc3-2650aae43c1a/29fc6528-0428-4a79-9234-007ae92394bf-1769707727045.mp4"
+                    DEFAULT_STING_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/branding/everlaunch-sting-v1.mp4"
+                    DEFAULT_CARD_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/branding/everlaunch-card-v1.mp4"
+                    body_q = sb.table("affiliate_videos").select("permanent_video_url").eq(
+                        "affiliate_id", COMPANY_AFFILIATE_ID
+                    ).eq("status", "ready").eq("video_type", "generic").eq("is_archived", False).order(
+                        "created_at", desc=True
+                    ).limit(1).execute()
+                    body_url = (body_q.data[0]["permanent_video_url"]
+                                if body_q.data and body_q.data[0].get("permanent_video_url")
+                                else DEFAULT_BODY_URL)
+
+                    # Fire Modal stitch_endpoint. Follows manual redirect
+                    # for Modal's 303 async polling pattern.
+                    stitch_url = "https://everlaunchsocial--everlaunch-avatar-stitch-endpoint.modal.run"
+                    payload = {
+                        "segments": [
+                            {"source_url": DEFAULT_CARD_URL},
+                            {"source_url": pu},
+                            {"source_url": DEFAULT_STING_URL},
+                            {"source_url": body_url},
+                        ],
+                        "output_name": f"everlaunch-{av_id}",
+                        "target_aspect": "landscape",
+                    }
+                    log(f"[finalize] firing stitch for av {av_id}")
+                    import requests as _req
+                    sresp = _req.post(stitch_url, json=payload, timeout=300, allow_redirects=False)
+
+                    # Handle 200 sync OR 303 async
+                    if sresp.status_code == 200:
+                        sj = sresp.json()
+                    elif sresp.status_code in (302, 303):
+                        loc = sresp.headers.get("Location")
+                        log(f"[finalize] async polling {loc}")
+                        deadline = time.time() + 300
+                        sj = None
+                        while time.time() < deadline:
+                            time.sleep(4)
+                            pr = _req.get(loc, timeout=30, allow_redirects=False)
+                            if pr.status_code == 200:
+                                sj = pr.json()
+                                break
+                            if pr.status_code not in (202, 302, 303):
+                                raise Exception(f"Poll error {pr.status_code}: {pr.text[:200]}")
+                        if sj is None:
+                            raise Exception("Stitch polling timed out (>5 min)")
+                    else:
+                        raise Exception(f"Stitch returned {sresp.status_code}: {sresp.text[:200]}")
+
+                    if sj.get("status") == "done" and sj.get("output_url"):
+                        stitched_url = sj["output_url"]
+                        sb.table("affiliate_videos").update({
+                            "permanent_video_url": stitched_url,
+                            "did_video_url": stitched_url,
+                            "status": "ready",
+                            "error_message": None,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }).eq("id", av_id).execute()
+                        log(f"[finalize] av {av_id} -> READY url={stitched_url}")
+                    else:
+                        err = sj.get("error") or sj.get("stderr") or f"stitch payload: {str(sj)[:200]}"
+                        sb.table("affiliate_videos").update({
+                            "status": "failed",
+                            "error_message": f"Stitch failed: {str(err)[:400]}",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }).eq("id", av_id).execute()
+                        log(f"[finalize] av {av_id} -> FAILED: {err}")
+        except Exception as _fin_exc:
+            log(f"[finalize] non-fatal exception: {_fin_exc}\n{traceback.format_exc()[-1500:]}")
+
     except Exception as e:
         log(f"FAILED:\n{traceback.format_exc()}")
         fail_job(sb, jid, str(e)[:2000])
@@ -686,6 +917,15 @@ def process_job(sb, engine, job):
 # ============================================================
 def main():
     ensure_env()
+    # ─── FINGERPRINT BANNER ───────────────────────────────────────
+    # Loud, easy to grep in Modal logs. If you don't see this line in
+    # the logs for a fresh job, the worker isn't running this code.
+    log(f"=========================================================")
+    log(f"=== BUILD_ID={BUILD_ID} ===")
+    log(f"=== STARTED_AT={datetime.now(timezone.utc).isoformat()} ===")
+    log(f"=== SUPABASE_SERVICE_KEY_set={SUPABASE_SERVICE_KEY is not None} ===")
+    log(f"=== SUPABASE_SERVICE_ROLE_KEY_fallback_set={_SVC_KEY_ROLE_FALLBACK is not None} ===")
+    log(f"=========================================================")
     log("starting")
     log(f"supabase: {SUPABASE_URL}")
     log(f"workspace: {WORKSPACE}")

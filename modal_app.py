@@ -28,7 +28,13 @@ image = (
     # The echo with a commit SHA busts Modal's image cache whenever we push new code.
     # Update this SHA when you push a worker.py change and want it picked up.
     .run_commands(
-        "echo 'cache_bust_2026_05_08_full_revert_to_34018eb'",
+        # IMPORTANT: bump this string EVERY TIME you push worker.py / scripts changes.
+        # Modal hashes run_commands to decide whether to rebuild the layer. If the
+        # string doesn't change, Modal reuses the cached layer including the cached
+        # git clone — which means your push to GitHub never makes it into the image.
+        # Symptom: BUILD_ID fingerprint missing from logs even after `modal deploy`
+        # reports success. We discovered this 2026-05-07 after fp2 didn't appear.
+        "echo 'cache_bust_2026_05_08_surgical_quality_revert'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
@@ -186,6 +192,12 @@ def download_quality_weights():
 # ─────────────────────────────────────────────────────────────
 @app.cls(
     image=image,
+    # H100 (80 GB) is the production-validated GPU for this pipeline.
+    # 2026-05-04: brief experiment with gpu="H200" was reverted by user
+    # request. V6 wizard renders (image_size unset → Modal default ~512)
+    # have always succeeded on H100. The H200 upgrade was only relevant
+    # for image_size=704 admin-studio renders, which is not a production
+    # path. Reverted to H100.
     gpu="H100",
     volumes={MODEL_DIR: model_volume},
     cpu=12,
@@ -465,6 +477,8 @@ def render_endpoint(
     without editing Supabase between tests.
     """
     overrides = {}
+    # FLOOR REMOVED — caller's inference_steps is always respected as-is.
+    # Reverted to original 5-step Fast preset behavior per user request.
     if inference_steps is not None:
         overrides["inference_steps"] = inference_steps
     if cfg_scale is not None:
@@ -498,9 +512,68 @@ def render_endpoint(
     if audio_url is not None:
         overrides["audio_url"] = audio_url
 
+    # Atomic claim BEFORE firing render_job. Without this, a row inserted
+    # by the Lovable edge function (status='pending') can be double-fired:
+    # once by this endpoint, and again by poll_pending_jobs 30s later,
+    # because process_job doesn't flip status='processing' until after
+    # model load / file download (30-60s into the render). That race
+    # caused users to pay 2x GPU cost per click.
+    #
+    # Pattern mirrors poll_pending_jobs (line 412-417): conditional
+    # UPDATE only succeeds if still pending. If another dispatcher already
+    # claimed this row, we short-circuit instead of starting a duplicate
+    # render.
+    import os as _os
+    from datetime import datetime, timezone
+    from supabase import create_client as _create_client
+    _sb_claim = _create_client(
+        _os.environ["SUPABASE_URL"],
+        _os.environ["SUPABASE_SERVICE_KEY"],
+    )
+    _now_iso = datetime.now(timezone.utc).isoformat()
+    _claim = _sb_claim.table("video_jobs").update({
+        "status": "processing",
+        "updated_at": _now_iso,
+    }).eq("id", job_id).eq("status", "pending").execute()
+    if not _claim.data:
+        # Row wasn't pending — either already claimed by poll_pending_jobs,
+        # already processing/done, or doesn't exist. Don't double-fire.
+        _existing = _sb_claim.table("video_jobs").select("id,status").eq("id", job_id).execute()
+        _current = _existing.data[0]["status"] if _existing.data else "not_found"
+        return {
+            "job_id": job_id,
+            "status": "skipped",
+            "reason": f"already {_current}; not re-firing to avoid duplicate render",
+        }
+
+    # FIRE-AND-FORGET — use .spawn() instead of .remote() so this HTTP
+    # endpoint returns immediately with a 202-style ack, instead of
+    # blocking until the render completes. Reason:
+    #
+    # .remote() is synchronous: the HTTP request hangs while
+    # render_job runs on the H100 worker. A 5-step render takes ~5 min;
+    # a 50-step render takes 8-15 min. The Supabase edge function that
+    # POSTs here has a finite wait window for outbound fetches — at
+    # 5 steps the call BARELY fits, at 50 steps it always exceeds and
+    # the edge function sees a 500/timeout from Modal even though the
+    # render itself is fine. Result: row marked status='failed' with
+    # 'Modal render failed (500): Internal Server Error' while Modal
+    # is still happily rendering. User cannot tell the difference.
+    #
+    # .spawn() returns a FunctionCall handle immediately. Render runs
+    # async in another container. Status flows through the existing
+    # video_jobs row updates (process_job marks status='processing'
+    # then 'done'/'failed' when finished) and the polling layer on the
+    # client side already handles those state transitions. No edge-fn
+    # timeout. Works at any step count.
     renderer = AvatarRenderer()
-    result = renderer.render_job.remote(job_id, overrides or None)
-    return result
+    call = renderer.render_job.spawn(job_id, overrides or None)
+    return {
+        "job_id": job_id,
+        "status": "started",
+        "modal_call_id": call.object_id,
+        "settings_applied": overrides,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -611,6 +684,24 @@ def stitch_endpoint(payload: dict):
     trimmed_files = []
     total_duration = 0.0
 
+    # Parameterized normalize target. Default 1920x1080 landscape for the
+    # EverLaunch landing-page stitch (rep intro + company body are both
+    # landscape). Pass target_aspect="portrait" for social-short stitches
+    # (9:16 rep-only or rep+portrait-card).
+    #
+    # CRITICAL: also forces fps=25 on every segment. ffmpeg concat filter
+    # requires matching frame rates across all inputs; mismatched fps
+    # (e.g. 30fps card + 25fps Hunyuan rep + 30fps sting + 25fps body)
+    # causes the concat to silently stall for several minutes instead
+    # of erroring cleanly. Hunyuan output is 25fps and HeyGen company
+    # body is 25fps, so 25 is the canonical rate. setsar=1 is required
+    # so concat doesn't also complain about pixel aspect mismatch.
+    target_aspect = str(payload.get("target_aspect") or "landscape").lower()
+    if target_aspect == "portrait":
+        NORMALIZE_VF = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=25,setsar=1"
+    else:
+        NORMALIZE_VF = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=25,setsar=1"
+
     try:
         # 1. For each segment: fetch source URL (from job_id OR direct
         # source_url), download, trim with ffmpeg. source_url lets callers
@@ -660,27 +751,71 @@ def stitch_endpoint(payload: dict):
             # appeared at cut. The cause was likely fast-seek keyframe
             # rounding. This switch fixes it.
             duration_s = None if end_s is None else max(0.0, end_s - start_s)
-            trim_args = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", src_file,
-                "-ss", f"{start_s:.3f}",  # NOW after -i (accurate seek)
-            ]
-            if duration_s is not None:
-                trim_args += ["-t", f"{duration_s:.3f}"]
-            trim_args += [
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k",
-                # No per-segment audio fade. Earlier attempt used 5ms
-                # fade-out + 5ms fade-in at each edge, but that created
-                # 10ms of near-silence at concat boundaries — heard as
-                # an audible duck/break in the middle of speech. The
-                # concat FILTER re-encodes audio samples in one pass
-                # which smooths any sample-level discontinuity naturally.
-                "-movflags", "+faststart",
-                trimmed_file,
-            ]
-            subprocess.run(trim_args, check=True)
+            # NORMALIZE_VF is computed once at the top of the function
+            # from the payload's target_aspect param (default landscape).
+
+            # Probe source for audio stream presence. If the source has no
+            # audio track (some company master videos are silent / video-
+            # only), add a synthetic silent audio stream during trim so
+            # downstream concat filter (which requires v=1:a=1) works.
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "a",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", src_file],
+                capture_output=True, text=True,
+            )
+            has_audio = bool(probe.stdout.strip())
+            # Audio normalize to 48kHz stereo regardless of source.
+            # Company body video is 96kHz mono; TTS intro is 44.1/48kHz stereo.
+            # Without standardizing, concat produces audio pops/gaps/pitch
+            # shifts at segment boundaries. -ar 48000 -ac 2 resolves this.
+            if has_audio:
+                trim_args = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", src_file,
+                    "-ss", f"{start_s:.3f}",  # accurate seek
+                ]
+                if duration_s is not None:
+                    trim_args += ["-t", f"{duration_s:.3f}"]
+                trim_args += [
+                    "-vf", NORMALIZE_VF,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-ar", "48000", "-ac", "2",
+                    "-movflags", "+faststart",
+                    trimmed_file,
+                ]
+            else:
+                print(f"[stitch] seg {idx}: no audio in source, adding silence")
+                trim_args = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", src_file,
+                    "-f", "lavfi", "-t", "3600",
+                    "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-ss", f"{start_s:.3f}",
+                ]
+                if duration_s is not None:
+                    trim_args += ["-t", f"{duration_s:.3f}"]
+                trim_args += [
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-vf", NORMALIZE_VF,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-ar", "48000", "-ac", "2",
+                    "-shortest",
+                    "-movflags", "+faststart",
+                    trimmed_file,
+                ]
+            try:
+                subprocess.run(trim_args, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                return {
+                    "status": "error",
+                    "error": f"ffmpeg trim seg {idx} failed",
+                    "stderr": (e.stderr or "")[-2000:],
+                    "cmd": " ".join(trim_args),
+                }
             trimmed_files.append(trimmed_file)
 
             if end_s is not None:
@@ -710,7 +845,15 @@ def stitch_endpoint(payload: dict):
             output_file,
         ]
         t_ff = time.time()
-        subprocess.run(concat_args, check=True)
+        try:
+            subprocess.run(concat_args, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            return {
+                "status": "error",
+                "error": "ffmpeg concat failed",
+                "stderr": (e.stderr or "")[-2000:],
+                "cmd": " ".join(concat_args),
+            }
         ffmpeg_time = time.time() - t_ff
 
         # 3. Upload to Supabase under stitched/ prefix.
