@@ -34,7 +34,7 @@ image = (
         # git clone — which means your push to GitHub never makes it into the image.
         # Symptom: BUILD_ID fingerprint missing from logs even after `modal deploy`
         # reports success. We discovered this 2026-05-07 after fp2 didn't appear.
-        "echo 'cache_bust_2026_05_07_fp2_54ad8bb'",
+        "echo 'cache_bust_2026_05_08_revert_quality_38bb3a0'",
         "rm -rf /workspace/HunyuanVideo-Avatar",
         "git clone https://github.com/everlaunchsocial/avatar.git /workspace/HunyuanVideo-Avatar",
     )
