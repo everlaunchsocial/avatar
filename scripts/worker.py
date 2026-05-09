@@ -832,13 +832,23 @@ def process_job(sb, engine, job):
                     DEFAULT_BODY_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/438c636d-cdea-4863-9fc3-2650aae43c1a/29fc6528-0428-4a79-9234-007ae92394bf-1769707727045.mp4"
                     DEFAULT_STING_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/branding/everlaunch-sting-v1.mp4"
                     DEFAULT_CARD_URL = "https://mrcfpbkoulldnkqzzprb.supabase.co/storage/v1/object/public/affiliate-videos/branding/everlaunch-card-v1.mp4"
-                    body_q = sb.table("affiliate_videos").select("permanent_video_url").eq(
-                        "affiliate_id", COMPANY_AFFILIATE_ID
-                    ).eq("status", "ready").eq("video_type", "generic").eq("is_archived", False).order(
-                        "created_at", desc=True
-                    ).limit(1).execute()
-                    body_url = (body_q.data[0]["permanent_video_url"]
-                                if body_q.data and body_q.data[0].get("permanent_video_url")
+                    # Resolve body URL from body_video_library (the canonical
+                    # source of truth for body videos). Previously this queried
+                    # Company affiliate's affiliate_videos rows where
+                    # video_type='generic' — which incorrectly matched a row
+                    # named "Company - E-commerce and Retail - Missed Call
+                    # Pitch" that had video_type='generic' as a legacy
+                    # placeholder despite containing e-commerce content.
+                    # Result: every wizard's main stitched output had an
+                    # e-commerce body in segment 4 instead of a generic body.
+                    # Fix: read from body_video_library.stock_body_url for
+                    # slug='generic_local_business' (the Tier-2A canonical
+                    # generic vertical).
+                    body_q = sb.table("body_video_library").select("stock_body_url").eq(
+                        "slug", "generic_local_business"
+                    ).eq("is_active", True).limit(1).execute()
+                    body_url = (body_q.data[0]["stock_body_url"]
+                                if body_q.data and body_q.data[0].get("stock_body_url")
                                 else DEFAULT_BODY_URL)
 
                     # Fire Modal stitch_endpoint. Follows manual redirect
